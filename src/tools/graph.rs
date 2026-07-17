@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 static SURREAL_STARTING: AtomicBool = AtomicBool::new(false);
+const GRAPH_SCHEMA_VERSION: u64 = 1;
 
 const SCHEMA_SQL: &str = r#"
     DEFINE TABLE IF NOT EXISTS fact SCHEMAFULL;
@@ -56,6 +57,9 @@ const SCHEMA_SQL: &str = r#"
     DEFINE FIELD IF NOT EXISTS timestamp ON graph_audit TYPE datetime;
     DEFINE FIELD IF NOT EXISTS undone ON graph_audit TYPE bool;
     DEFINE INDEX IF NOT EXISTS graph_audit_time ON graph_audit COLUMNS timestamp;
+    DEFINE TABLE IF NOT EXISTS agent_meta SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS version ON agent_meta TYPE int;
+    DEFINE FIELD IF NOT EXISTS updated_at ON agent_meta TYPE datetime;
 "#;
 
 fn db_url() -> String {
@@ -255,14 +259,54 @@ pub async fn ensure_ready() -> Result<(), String> {
         ensure_local_surrealdb().await?;
     }
 
-    let results = raw_db_query(SCHEMA_SQL).await?;
-    for row in &results {
-        if row["status"] == "ERR" {
-            let msg = row["result"].as_str().unwrap_or("unknown schema error");
-            return Err(format!("schema init failed: {msg}"));
+    let database_info = raw_db_query("INFO FOR DB").await?;
+    let version_rows = if database_has_table(&database_info, "agent_meta") {
+        raw_db_query("SELECT version FROM agent_meta:schema").await?
+    } else {
+        Vec::new()
+    };
+    match parse_schema_version(&version_rows) {
+        Some(version) if version > GRAPH_SCHEMA_VERSION => {
+            return Err(format!(
+                "graph schema version {version} is newer than this UIntell Agent supports ({GRAPH_SCHEMA_VERSION})"
+            ));
         }
+        Some(GRAPH_SCHEMA_VERSION) => {}
+        Some(version) => {
+            return Err(format!(
+                "graph schema version {version} requires an unavailable migration"
+            ));
+        }
+        None => {}
+    }
+
+    raw_db_query(SCHEMA_SQL)
+        .await
+        .map_err(|error| format!("schema init failed: {error}"))?;
+    if parse_schema_version(&version_rows).is_none() {
+        raw_db_query(&format!(
+            "UPSERT agent_meta:schema SET version = {GRAPH_SCHEMA_VERSION}, updated_at = time::now()"
+        ))
+        .await?;
     }
     Ok(())
+}
+
+fn parse_schema_version(rows: &[Value]) -> Option<u64> {
+    rows.iter()
+        .filter_map(|row| row.get("result"))
+        .flat_map(|result| match result {
+            Value::Array(values) => values.iter().collect::<Vec<_>>(),
+            value => vec![value],
+        })
+        .find_map(|value| value.get("version").and_then(Value::as_u64))
+}
+
+fn database_has_table(rows: &[Value], table: &str) -> bool {
+    rows.iter()
+        .filter_map(|row| row.get("result"))
+        .filter_map(|result| result.get("tables"))
+        .any(|tables| tables.get(table).is_some())
 }
 
 fn spawn_local_surrealdb() -> Result<(), String> {
@@ -874,5 +918,25 @@ mod tests {
             parse_surreal_response(body).expect_err("error response"),
             "bad query"
         );
+    }
+
+    #[test]
+    fn graph_schema_version_is_read_from_query_rows() {
+        let rows = vec![json!({
+            "status": "OK",
+            "result": [{"id": "agent_meta:schema", "version": 1}]
+        })];
+        assert_eq!(parse_schema_version(&rows), Some(GRAPH_SCHEMA_VERSION));
+        assert_eq!(parse_schema_version(&[]), None);
+    }
+
+    #[test]
+    fn graph_metadata_detects_existing_schema_table() {
+        let rows = vec![json!({
+            "status": "OK",
+            "result": {"tables": {"fact": "DEFINE TABLE fact", "agent_meta": "DEFINE TABLE agent_meta"}}
+        })];
+        assert!(database_has_table(&rows, "agent_meta"));
+        assert!(!database_has_table(&rows, "missing"));
     }
 }

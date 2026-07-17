@@ -6,8 +6,12 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
+
+const MAX_STDOUT_BYTES: usize = 1_000_000;
+const MAX_STDERR_BYTES: usize = 500_000;
 
 #[derive(Deserialize)]
 pub struct CodeExecArgs {
@@ -154,14 +158,68 @@ async fn run_command(
 ) -> Result<String, CodeExecError> {
     let mut command = sandboxed_command(program, args, cwd)?;
 
-    let child = command
+    let mut child = command
         .spawn()
         .map_err(|error| CodeExecError::new(format!("start {program}: {error}")))?;
-    match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-        Ok(Ok(output)) => Ok(format_output(&output)),
-        Ok(Err(error)) => Err(CodeExecError::new(format!("wait for {program}: {error}"))),
-        Err(_) => Ok(format!("[timeout after {timeout_secs}s]\n[exit: -1]")),
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CodeExecError::new(format!("capture {program} stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CodeExecError::new(format!("capture {program} stderr")))?;
+    let stdout_task = tokio::spawn(read_pipe(stdout, MAX_STDOUT_BYTES));
+    let stderr_task = tokio::spawn(read_pipe(stderr, MAX_STDERR_BYTES));
+
+    let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let _ = child.start_kill();
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(CodeExecError::new(format!("wait for {program}: {error}")));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Ok(format!("[timeout after {timeout_secs}s]\n[exit: -1]"));
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .map_err(|error| CodeExecError::new(format!("join {program} stdout reader: {error}")))?
+        .map_err(|error| CodeExecError::new(format!("read {program} stdout: {error}")))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| CodeExecError::new(format!("join {program} stderr reader: {error}")))?
+        .map_err(|error| CodeExecError::new(format!("read {program} stderr: {error}")))?;
+    Ok(format_output(status, stdout, stderr))
+}
+
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_pipe<R>(mut reader: R, max_bytes: usize) -> std::io::Result<CapturedOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        truncated |= read > remaining;
     }
+    Ok(CapturedOutput { bytes, truncated })
 }
 
 fn sandboxed_command(
@@ -299,20 +357,34 @@ fn unsandboxed_override_enabled() -> bool {
     std::env::var("UINTELL_ALLOW_UNSANDBOXED_CODE").as_deref() == Ok("1")
 }
 
-fn format_output(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let exit = output.status.code().unwrap_or(-1);
+fn format_output(
+    status: std::process::ExitStatus,
+    stdout: CapturedOutput,
+    stderr: CapturedOutput,
+) -> String {
+    let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+    let exit = status.code().unwrap_or(-1);
 
     let mut result = String::new();
-    if !stdout.is_empty() {
-        result.push_str(&stdout);
+    if !stdout_text.is_empty() {
+        result.push_str(&stdout_text);
     }
-    if !stderr.is_empty() {
+    if stdout.truncated {
+        result.push_str(&format!(
+            "\n... [stdout truncated at {MAX_STDOUT_BYTES} bytes]"
+        ));
+    }
+    if !stderr_text.is_empty() {
         if !result.is_empty() {
             result.push('\n');
         }
-        result.push_str(&format!("[stderr]\n{stderr}"));
+        result.push_str(&format!("[stderr]\n{stderr_text}"));
+    }
+    if stderr.truncated {
+        result.push_str(&format!(
+            "\n... [stderr truncated at {MAX_STDERR_BYTES} bytes]"
+        ));
     }
     result.push_str(&format!("\n[exit: {exit}]"));
     result
@@ -370,5 +442,18 @@ mod tests {
     fn sandbox_is_enabled_by_default() {
         std::env::remove_var("UINTELL_CODE_SANDBOX");
         assert!(sandbox_enabled());
+    }
+
+    #[tokio::test]
+    async fn captured_output_is_bounded_while_the_pipe_is_drained() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            writer.write_all(b"0123456789").await.unwrap();
+        });
+        let output = read_pipe(reader, 4).await.unwrap();
+        writer_task.await.unwrap();
+        assert_eq!(output.bytes, b"0123");
+        assert!(output.truncated);
     }
 }

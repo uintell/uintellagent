@@ -3,7 +3,7 @@ use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -15,6 +15,7 @@ pub struct FileChange {
 }
 
 static FILE_CHANGES: LazyLock<Mutex<Vec<FileChange>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 
 pub(crate) fn take_file_changes() -> Vec<FileChange> {
     FILE_CHANGES
@@ -53,7 +54,12 @@ pub(crate) fn write_review_result(
     expected: Option<&[u8]>,
     result: Option<&[u8]>,
 ) -> Result<(), String> {
-    let current = std::fs::read(path).ok();
+    if result.is_some_and(|content| content.len() > MAX_FILE_BYTES) {
+        return Err(format!(
+            "review result exceeds the {MAX_FILE_BYTES} byte file limit"
+        ));
+    }
+    let current = read_existing_bounded(path).map_err(|error| error.message)?;
     if current.as_deref() != expected {
         return Err(format!(
             "{} changed again after the review opened; reload before resolving it",
@@ -117,8 +123,25 @@ impl Tool for FileRead {
             return Ok(reason);
         }
 
-        let content = std::fs::read_to_string(&args.path).map_err(|error| FileReadError {
-            message: format!("read {}: {error}", args.path),
+        let file = std::fs::File::open(&args.path).map_err(|error| FileReadError {
+            message: format!("open {}: {error}", args.path),
+        })?;
+        let mut bytes = Vec::new();
+        file.take((MAX_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| FileReadError {
+                message: format!("read {}: {error}", args.path),
+            })?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(FileReadError {
+                message: format!(
+                    "{} exceeds the {} byte file_read limit",
+                    args.path, MAX_FILE_BYTES
+                ),
+            });
+        }
+        let content = String::from_utf8(bytes).map_err(|_| FileReadError {
+            message: format!("{} is not valid UTF-8 text", args.path),
         })?;
         let lines: Vec<&str> = content.lines().collect();
 
@@ -189,6 +212,11 @@ impl Tool for FileWrite {
         if let Err(reason) = crate::permissions::enforce_tool_call(Self::NAME, &permission_args) {
             return Ok(reason);
         }
+        if args.content.len() > MAX_FILE_BYTES {
+            return Err(FileWriteError::new(format!(
+                "content exceeds the {MAX_FILE_BYTES} byte file_write limit"
+            )));
+        }
 
         if let Some(parent) = path
             .parent()
@@ -198,12 +226,38 @@ impl Tool for FileWrite {
                 FileWriteError::new(format!("create {}: {error}", parent.display()))
             })?;
         }
-        let before = std::fs::read(path).ok();
+        let before = read_existing_bounded(path)?;
         let after = args.content.into_bytes();
         atomic_write(path, &after)?;
         publish_file_change(path, before, after.clone());
         Ok(format!("Wrote {} bytes to {}", after.len(), args.path))
     }
+}
+
+fn read_existing_bounded(path: &Path) -> Result<Option<Vec<u8>>, FileWriteError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(FileWriteError::new(format!(
+                "open existing {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take((MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            FileWriteError::new(format!("read existing {}: {error}", path.display()))
+        })?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(FileWriteError::new(format!(
+            "existing {} exceeds the {MAX_FILE_BYTES} byte file limit",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<(), FileWriteError> {
@@ -304,5 +358,19 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].before.as_deref(), Some(b"first".as_slice()));
         assert_eq!(changes[0].after.as_deref(), Some(b"third".as_slice()));
+    }
+
+    #[test]
+    fn oversized_existing_files_are_rejected_without_full_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "uintell-file-oversized-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_FILE_BYTES + 1) as u64).unwrap();
+        let error = read_existing_bounded(&path).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -4,11 +4,11 @@ Rust-native AI agent with a TUI, HTTP gateway, tool execution, provider mesh, an
 
 ## Install
 
-The first public alpha supports Linux on x86-64. Download and verify the
-release archive:
+UIntell Agent 1.0 supports glibc-based Linux on x86-64. Download and verify the
+stable release archive:
 
 ```bash
-version=0.3.0-alpha.1
+version=1.0.0
 asset="uintell-agent-${version}-x86_64-unknown-linux-gnu"
 base_url="https://github.com/uintell/uintellagent/releases/download/v${version}"
 
@@ -20,11 +20,23 @@ cd "$asset"
 ./install.sh
 export PATH="$HOME/.local/bin:$PATH"
 uintell-agent doctor
+uintell-agent --tui
 ```
 
 The installer copies the binary to `~/.local/bin` by default. Set
 `UINTELL_INSTALL_DIR` to choose another location. Release files and notes are
 available on the [Releases page](https://github.com/uintell/uintellagent/releases).
+When upgrading, the installer preserves the previous binary as
+`uintell-agent.previous`. Run the extracted package's `./install.sh --rollback`
+with the same `UINTELL_INSTALL_DIR` to swap back.
+
+GitHub Actions signs the build provenance for both release artifacts. With the
+GitHub CLI installed, verify that the downloaded archive came from this
+repository:
+
+```bash
+gh attestation verify "${asset}.tar.gz" --repo uintell/uintellagent
+```
 
 Graph memory requires the `surreal` CLI in `PATH`. Sandboxed code execution
 requires `/usr/bin/bwrap`. DeepSeek requires `DEEPSEEK_API_KEY`; local models
@@ -45,10 +57,19 @@ cargo build --release --locked
 
 - Tool calls pass through a shared permission engine.
 - Dangerous actions require confirmation unless pre-approved.
+- Automatic workspace shell calls are parsed as argv and run without shell
+  expansion, aliases, functions, or the caller's `PATH`.
 - Shell sessions preserve state and capture real exit codes.
 - Code execution runs through `bubblewrap` by default.
 - HTTP gateway requires `UINTELL_API_KEY` for `/ready` and `/chat`.
+- Provider credentials are never accepted as gateway authentication keys.
 - Graph memory validates record IDs and serializes user text before building SurrealQL.
+- Release artifacts have SHA-256 checksums and signed build provenance.
+
+See [SECURITY.md](SECURITY.md) for deployment guidance and
+[COMPATIBILITY.md](COMPATIBILITY.md) for the stable `1.x` support contract. The
+[gateway reference](docs/GATEWAY.md) documents the authenticated HTTP API,
+limits, status codes, and CORS configuration.
 
 ## Commands
 
@@ -93,6 +114,24 @@ The unified TUI workspaces are:
 
 The active workspace, editor file/cursor, selected task run, and graph view are
 restored from `~/.uintell/workspace.json` on the next launch.
+
+## Instruction Skills
+
+Create a private local instruction skill, edit its Markdown entrypoint, and
+select it explicitly when launching an agent:
+
+```bash
+uintell-agent skill-new rust-review "Review Rust changes against project conventions"
+$EDITOR ~/.uintell/skills/rust-review/SKILL.md
+uintell-agent --skill rust-review --tui
+uintell-agent skills
+```
+
+Selected skills are appended to the model's system instructions. Skill names
+and entrypoints are traversal-safe, each instruction file is limited to 64 KiB,
+and at most eight skills can be active at once. Skill directories and files are
+created with private permissions. UIntell Agent 1.0 skills are instruction
+modules, not executable plugins.
 
 ## Durable Coding Runs
 

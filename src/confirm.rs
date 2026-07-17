@@ -3,7 +3,7 @@
 // Modes:
 //   TUI interactive — shows confirmation dialog (oneshot channel → TUI)
 //   CLI interactive — asks [y/N] on stdin (200ms TUI timeout, then stdin fallback)
-//   auto_approve    — allows only calls that do not require confirmation
+//   non-interactive — allows only calls that do not require confirmation
 
 use rig_core::agent::hook::{AgentHook, Flow, HookContext, StepEvent};
 use rig_core::completion::CompletionModel;
@@ -115,7 +115,7 @@ impl ConfirmHook {
         Self::with_state(Some(state))
     }
 
-    pub fn auto_approve() -> Self {
+    pub fn non_interactive() -> Self {
         Self::with_state(None)
     }
 

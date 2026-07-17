@@ -10,19 +10,24 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 static APPROVED_CALLS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+const PERMISSIONS_CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionsConfig {
+    #[serde(default = "current_config_version")]
+    pub config_version: u32,
     pub mode: PermissionMode,
     /// Directories where writes are allowed (workspace mode)
     #[serde(default)]
     pub workspace_dirs: Vec<String>,
-    /// Shell commands allowed (regex patterns, workspace + full mode)
+    /// Shell command prefixes eligible for automatic execution in workspace mode.
+    /// Shell syntax and command-specific argument policies still apply.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
     /// Shell commands always denied
@@ -55,6 +60,10 @@ fn default_true() -> bool {
     true
 }
 
+fn current_config_version() -> u32 {
+    PERMISSIONS_CONFIG_VERSION
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
@@ -66,8 +75,9 @@ pub enum PermissionMode {
 impl Default for PermissionsConfig {
     fn default() -> Self {
         Self {
+            config_version: PERMISSIONS_CONFIG_VERSION,
             mode: PermissionMode::Workspace,
-            workspace_dirs: vec![".".into(), "/Uintellagent".into()],
+            workspace_dirs: vec![".".into()],
             allowed_commands: vec![
                 "ls".into(),
                 "cat".into(),
@@ -79,20 +89,10 @@ impl Default for PermissionsConfig {
                 "file".into(),
                 "git".into(),
                 "cargo".into(),
-                "python".into(),
-                "python3".into(),
-                "node".into(),
-                "rustc".into(),
                 "code_exec".into(),
                 "npm".into(),
                 "pnpm".into(),
-                "curl".into(),
-                "wget".into(),
-                "systemctl".into(),
-                "docker".into(),
                 "ps".into(),
-                "top".into(),
-                "htop".into(),
                 "df".into(),
                 "du".into(),
                 "echo".into(),
@@ -105,31 +105,6 @@ impl Default for PermissionsConfig {
                 "awk".into(),
                 "wc".into(),
                 "which".into(),
-                "touch".into(),
-                "env".into(),
-                "mkdir".into(),
-                "cp".into(),
-                "mv".into(),
-                "rm".into(),
-                "chmod".into(),
-                "chown".into(),
-                "cargo build".into(),
-                "cargo test".into(),
-                "cargo run".into(),
-                "cargo check".into(),
-                "cargo clippy".into(),
-                "cargo fmt".into(),
-                "git add".into(),
-                "git commit".into(),
-                "git push".into(),
-                "git pull".into(),
-                "git status".into(),
-                "git diff".into(),
-                "git log".into(),
-                "systemctl start".into(),
-                "systemctl stop".into(),
-                "systemctl restart".into(),
-                "systemctl status".into(),
             ],
             denied_commands: vec![
                 "rm -rf /".into(),
@@ -141,26 +116,26 @@ impl Default for PermissionsConfig {
                 "halt".into(),
                 "poweroff".into(),
             ],
-            allowed_read_paths: vec![
-                "~".into(),
-                "/home".into(),
-                "/tmp".into(),
-                "/Uintellagent".into(),
-            ],
+            allowed_read_paths: vec!["/tmp".into()],
             denied_read_paths: vec![
                 "/etc/shadow".into(),
                 ".ssh".into(),
+                ".aws".into(),
+                ".gnupg".into(),
+                ".kube".into(),
+                ".docker".into(),
+                ".env*".into(),
+                ".netrc".into(),
+                ".npmrc".into(),
+                ".pypirc".into(),
                 "*.pem".into(),
                 "*.key".into(),
+                "*.p12".into(),
+                "*.pfx".into(),
                 "id_rsa".into(),
                 "id_ed25519".into(),
             ],
-            allowed_write_paths: vec![
-                "/tmp".into(),
-                "/Uintellagent".into(),
-                "/home/x1".into(),
-                ".".into(),
-            ],
+            allowed_write_paths: vec!["/tmp".into()],
             denied_write_paths: vec![
                 "/etc".into(),
                 "/boot".into(),
@@ -177,6 +152,7 @@ impl Default for PermissionsConfig {
                 "crates.io".into(),
                 "github.com".into(),
                 "raw.githubusercontent.com".into(),
+                "openrouter.ai".into(),
             ],
             denied_hosts: vec![],
             confirm_destructive: true,
@@ -186,28 +162,142 @@ impl Default for PermissionsConfig {
 
 impl PermissionsConfig {
     pub fn load() -> Self {
-        let path = config_path();
+        let path = match config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("UIntell permissions are unavailable: {error}; using read-only policy");
+                return Self::fail_closed();
+            }
+        };
         if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = toml::from_str(&content) {
-                    return cfg;
+            match std::fs::read_to_string(&path).map_err(|error| error.to_string()) {
+                Ok(content) => match toml::from_str::<Self>(&content) {
+                    Ok(mut cfg) => {
+                        let has_version = toml::from_str::<toml::Value>(&content)
+                            .ok()
+                            .and_then(|value| value.as_table().cloned())
+                            .is_some_and(|table| table.contains_key("config_version"));
+                        if !has_version {
+                            cfg.migrate_alpha_defaults();
+                            if let Err(error) = write_default_config(&path, &cfg) {
+                                eprintln!(
+                                    "UIntell could not persist the permission migration at {}: {error}",
+                                    path.display()
+                                );
+                            }
+                        }
+                        if let Err(error) = cfg.validate() {
+                            eprintln!(
+                            "UIntell permissions are invalid at {}: {error}; using read-only policy",
+                            path.display()
+                        );
+                            return Self::fail_closed();
+                        }
+                        return cfg;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "UIntell permissions could not be loaded from {}: {error}; using read-only policy",
+                            path.display()
+                        );
+                        return Self::fail_closed();
+                    }
+                },
+                Err(error) => {
+                    eprintln!(
+                        "UIntell permissions could not be loaded from {}: {error}; using read-only policy",
+                        path.display()
+                    );
+                    return Self::fail_closed();
                 }
             }
         }
-        // Write default config
+
         let default = Self::default();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(toml_str) = toml::to_string_pretty(&default) {
-            let _ = std::fs::write(&path, toml_str);
+        if let Err(error) = write_default_config(&path, &default) {
+            eprintln!(
+                "UIntell could not create {}: {error}; using read-only policy",
+                path.display()
+            );
+            return Self::fail_closed();
         }
         default
+    }
+
+    fn migrate_alpha_defaults(&mut self) {
+        self.config_version = PERMISSIONS_CONFIG_VERSION;
+        self.workspace_dirs.retain(|path| path != "/Uintellagent");
+        if self.workspace_dirs.is_empty() {
+            self.workspace_dirs.push(".".into());
+        }
+        self.allowed_read_paths
+            .retain(|path| !matches!(path.as_str(), "~" | "/home" | "/Uintellagent"));
+        self.allowed_write_paths
+            .retain(|path| !matches!(path.as_str(), "/Uintellagent" | "/home/x1" | "."));
+
+        self.allowed_commands.retain(|command| {
+            !matches!(
+                command.as_str(),
+                "python"
+                    | "python3"
+                    | "node"
+                    | "rustc"
+                    | "curl"
+                    | "wget"
+                    | "systemctl"
+                    | "docker"
+                    | "top"
+                    | "htop"
+                    | "touch"
+                    | "env"
+                    | "mkdir"
+                    | "cp"
+                    | "mv"
+                    | "rm"
+                    | "chmod"
+                    | "chown"
+            )
+        });
+        for pattern in Self::default().denied_read_paths {
+            if !self.denied_read_paths.contains(&pattern) {
+                self.denied_read_paths.push(pattern);
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.config_version != PERMISSIONS_CONFIG_VERSION {
+            return Err(format!(
+                "unsupported config version {} (expected {})",
+                self.config_version, PERMISSIONS_CONFIG_VERSION
+            ));
+        }
+        Ok(())
+    }
+
+    fn fail_closed() -> Self {
+        Self {
+            config_version: PERMISSIONS_CONFIG_VERSION,
+            mode: PermissionMode::ReadOnly,
+            workspace_dirs: Vec::new(),
+            allowed_commands: Vec::new(),
+            denied_commands: vec!["*".into()],
+            allowed_read_paths: Vec::new(),
+            denied_read_paths: vec!["*".into()],
+            allowed_write_paths: Vec::new(),
+            denied_write_paths: vec!["*".into()],
+            allowed_hosts: Vec::new(),
+            denied_hosts: vec!["*".into()],
+            confirm_destructive: true,
+        }
     }
 
     pub fn can_execute_shell(&self, command: &str) -> PermissionResult {
         if self.mode == PermissionMode::ReadOnly {
             return PermissionResult::Denied("read-only mode: no shell access".into());
+        }
+        if command.len() > 64 * 1024 {
+            return PermissionResult::Denied("shell command exceeds the 65536 byte limit".into());
         }
         // Check denied first
         for pattern in &self.denied_commands {
@@ -217,9 +307,13 @@ impl PermissionsConfig {
                 ));
             }
         }
-        if self.confirm_destructive && is_destructive_command(command) {
+        let argv = match parse_simple_shell_command(command) {
+            Ok(argv) => argv,
+            Err(reason) => return PermissionResult::Confirm(reason.into()),
+        };
+        if self.confirm_destructive && requires_shell_confirmation(&argv) {
             return PermissionResult::Confirm(format!(
-                "destructive shell command requires confirmation: {command}"
+                "state-changing or privileged shell command requires confirmation: {command}"
             ));
         }
         // In full access, allow anything not denied
@@ -227,16 +321,21 @@ impl PermissionsConfig {
             return PermissionResult::Allowed;
         }
         // Workspace mode: check allow list
-        for pattern in &self.allowed_commands {
-            if command.starts_with(pattern.as_str()) {
-                return PermissionResult::Allowed;
-            }
+        if !self
+            .allowed_commands
+            .iter()
+            .any(|pattern| command_pattern_matches(pattern, &argv))
+        {
+            return PermissionResult::Confirm(format!("command not in allow-list: {command}"));
         }
-        PermissionResult::Confirm(format!("command not in allow-list: {command}"))
+        match workspace_command_policy(&argv) {
+            Ok(()) => PermissionResult::Allowed,
+            Err(reason) => PermissionResult::Confirm(reason.into()),
+        }
     }
 
     pub fn can_read_file(&self, path: &Path) -> PermissionResult {
-        let normalized = normalize_path(path);
+        let normalized = resolve_for_policy(path);
         let path_str = normalized.to_string_lossy();
         // Check denied first
         for pattern in &self.denied_read_paths {
@@ -267,7 +366,7 @@ impl PermissionsConfig {
         if self.mode == PermissionMode::ReadOnly {
             return PermissionResult::Denied("read-only mode: no file writes".into());
         }
-        let normalized = normalize_path(path);
+        let normalized = resolve_for_policy(path);
         let path_str = normalized.to_string_lossy();
         for pattern in &self.denied_write_paths {
             if glob_match(pattern, &path_str) {
@@ -292,7 +391,7 @@ impl PermissionsConfig {
 
     pub fn can_access_network(&self, host: &str) -> PermissionResult {
         for pattern in &self.denied_hosts {
-            if host.contains(pattern.as_str()) {
+            if domain_matches(pattern, host) {
                 return PermissionResult::Denied(format!("host matches deny pattern: {pattern}"));
             }
         }
@@ -300,7 +399,7 @@ impl PermissionsConfig {
             return PermissionResult::Allowed;
         }
         for pattern in &self.allowed_hosts {
-            if host.contains(pattern.as_str()) || pattern.contains(host) {
+            if domain_matches(pattern, host) {
                 return PermissionResult::Allowed;
             }
         }
@@ -334,23 +433,30 @@ pub enum PermissionResult {
 pub fn permission_for_tool(tool_name: &str, args_json: &str) -> PermissionResult {
     let cfg = PermissionsConfig::load();
     let args = serde_json::from_str::<Value>(args_json).unwrap_or(Value::Null);
+    permission_for_tool_with_config(&cfg, tool_name, &args)
+}
 
+fn permission_for_tool_with_config(
+    cfg: &PermissionsConfig,
+    tool_name: &str,
+    args: &Value,
+) -> PermissionResult {
     match tool_name {
-        "terminal" => string_arg(&args, "command")
+        "terminal" => string_arg(args, "command")
             .map(|command| cfg.can_execute_shell(command))
             .unwrap_or_else(|| PermissionResult::Denied("missing terminal command".into())),
         "code_exec" => cfg.can_execute_shell("code_exec"),
-        "file_read" => string_arg(&args, "path")
+        "file_read" => string_arg(args, "path")
             .map(|path| cfg.can_read_file(Path::new(path)))
             .unwrap_or_else(|| PermissionResult::Denied("missing file path".into())),
-        "file_write" => string_arg(&args, "path")
+        "file_write" => string_arg(args, "path")
             .map(|path| cfg.can_write_file(Path::new(path)))
             .unwrap_or_else(|| PermissionResult::Denied("missing file path".into())),
         "file_search" => {
-            let path = string_arg(&args, "path").unwrap_or(".");
+            let path = string_arg(args, "path").unwrap_or(".");
             cfg.can_read_file(Path::new(path))
         }
-        "browser" => string_arg(&args, "url")
+        "browser" => string_arg(args, "url")
             .and_then(url_host)
             .map(|host| cfg.can_access_network(&host))
             .unwrap_or_else(|| PermissionResult::Denied("missing or invalid URL".into())),
@@ -359,7 +465,8 @@ pub fn permission_for_tool(tool_name: &str, args_json: &str) -> PermissionResult
         "graph_edit" => cfg.can_access_db("UPDATE"),
         "graph_forget" => cfg.can_access_db("DELETE"),
         "graph_query" | "graph_context" => cfg.can_access_db("SELECT"),
-        _ => PermissionResult::Allowed,
+        "provider_mesh" => provider_mesh_permission(cfg, args),
+        _ => PermissionResult::Denied(format!("unknown tool: {tool_name}")),
     }
 }
 
@@ -388,20 +495,89 @@ pub fn enforce_tool_call(tool_name: &str, args_json: &str) -> Result<(), String>
     }
 }
 
-pub(crate) fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".uintell")
-        .join("permissions.toml")
+pub fn authorize_terminal_command(command: &str, args_json: &str) -> Result<String, String> {
+    let cfg = PermissionsConfig::load();
+    match cfg.can_execute_shell(command) {
+        PermissionResult::Allowed if cfg.mode == PermissionMode::Workspace => {
+            let argv = parse_simple_shell_command(command)
+                .map_err(|reason| format!("PERMISSION DENIED: {reason}"))?;
+            Ok(render_restricted_command(&argv))
+        }
+        PermissionResult::Allowed => Ok(command.to_string()),
+        PermissionResult::Denied(reason) => Err(format!("PERMISSION DENIED: {reason}")),
+        PermissionResult::Confirm(reason) => {
+            let key = approval_key("terminal", args_json);
+            let approved = APPROVED_CALLS
+                .lock()
+                .map(|mut approvals| approvals.remove(&key))
+                .unwrap_or(false);
+            if approved {
+                Ok(command.to_string())
+            } else {
+                Err(format!("CONFIRMATION REQUIRED: {reason}"))
+            }
+        }
+    }
+}
+
+pub(crate) fn config_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_string())?;
+    if !home.is_absolute() {
+        return Err("HOME must be an absolute path".into());
+    }
+    Ok(home.join(".uintell").join("permissions.toml"))
+}
+
+fn write_default_config(path: &Path, config: &PermissionsConfig) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "permissions path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let contents = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
+    let temporary = parent.join(format!(
+        ".permissions-{}-{:x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
 }
 
 fn expand_tilde(path: &str) -> String {
     if path.starts_with('~') {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-        path.replacen('~', &home, 1)
-    } else {
-        path.to_string()
+        if let Some(home) = std::env::var_os("HOME").filter(|home| Path::new(home).is_absolute()) {
+            return path.replacen('~', &home.to_string_lossy(), 1);
+        }
     }
+    path.to_string()
 }
 
 fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -409,10 +585,11 @@ fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn url_host(url: &str) -> Option<String> {
-    let s = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    Some(s.split('/').next()?.split(':').next()?.to_string())
+    let parsed = url::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed.host_str().map(str::to_string)
 }
 
 fn approval_key(tool_name: &str, args_json: &str) -> String {
@@ -435,22 +612,265 @@ fn approval_key(tool_name: &str, args_json: &str) -> String {
     format!("{tool_name}:{}", blake3::hash(subject.as_bytes()))
 }
 
-fn is_destructive_command(command: &str) -> bool {
-    let trimmed = command.trim_start();
-    let first = trimmed.split_whitespace().next().unwrap_or("");
-    matches!(
+fn requires_shell_confirmation(argv: &[String]) -> bool {
+    let first = argv.first().map(String::as_str).unwrap_or("");
+    if matches!(
         first,
         "rm" | "mv"
+            | "cp"
+            | "ln"
+            | "mkdir"
+            | "rmdir"
+            | "touch"
+            | "truncate"
+            | "install"
+            | "tee"
             | "chmod"
             | "chown"
             | "dd"
             | "mkfs"
+            | "mount"
+            | "umount"
             | "shutdown"
             | "reboot"
             | "halt"
             | "poweroff"
-    ) || trimmed.contains(" rm -")
-        || trimmed.contains(">/dev/")
+            | "systemctl"
+            | "docker"
+            | "ssh"
+            | "scp"
+            | "rsync"
+            | "curl"
+            | "wget"
+            | "python"
+            | "python3"
+            | "node"
+            | "rustc"
+            | "env"
+            | "printenv"
+            | "code_exec"
+            | "find"
+            | "sed"
+            | "awk"
+            | "cargo"
+            | "npm"
+            | "pnpm"
+            | "git"
+    ) {
+        return true;
+    }
+    false
+}
+
+fn command_pattern_matches(pattern: &str, argv: &[String]) -> bool {
+    parse_simple_shell_command(pattern)
+        .ok()
+        .is_some_and(|prefix| !prefix.is_empty() && argv.starts_with(&prefix))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellQuote {
+    Unquoted,
+    Single,
+    Double,
+}
+
+fn parse_simple_shell_command(command: &str) -> Result<Vec<String>, &'static str> {
+    let mut quote = ShellQuote::Unquoted;
+    let mut current = String::new();
+    let mut words = Vec::new();
+    let mut word_started = false;
+
+    for character in command.chars() {
+        if matches!(character, '\0' | '\n' | '\r') {
+            return Err("multiline or NUL shell input requires confirmation");
+        }
+        match quote {
+            ShellQuote::Single => {
+                if character == '\'' {
+                    quote = ShellQuote::Unquoted;
+                } else {
+                    current.push(character);
+                }
+                word_started = true;
+            }
+            ShellQuote::Double => {
+                if character == '"' {
+                    quote = ShellQuote::Unquoted;
+                } else if matches!(character, '$' | '`' | '\\') {
+                    return Err("shell expansion or escaping requires confirmation");
+                } else {
+                    current.push(character);
+                }
+                word_started = true;
+            }
+            ShellQuote::Unquoted => {
+                if character.is_whitespace() {
+                    if word_started {
+                        words.push(std::mem::take(&mut current));
+                        word_started = false;
+                    }
+                } else if character == '\'' {
+                    quote = ShellQuote::Single;
+                    word_started = true;
+                } else if character == '"' {
+                    quote = ShellQuote::Double;
+                    word_started = true;
+                } else if matches!(
+                    character,
+                    '$' | '`'
+                        | '\\'
+                        | ';'
+                        | '&'
+                        | '|'
+                        | '<'
+                        | '>'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '('
+                        | ')'
+                        | '~'
+                        | '!'
+                        | '#'
+                ) {
+                    return Err(
+                        "shell expansion, control syntax, or globbing requires confirmation",
+                    );
+                } else {
+                    current.push(character);
+                    word_started = true;
+                }
+            }
+        }
+    }
+
+    if quote != ShellQuote::Unquoted {
+        return Err("unclosed shell quote requires confirmation");
+    }
+    if word_started {
+        words.push(current);
+    }
+    if words.is_empty() {
+        return Err("empty shell command requires confirmation");
+    }
+    if words.len() > 256 || words.iter().any(|word| word.len() > 16 * 1024) {
+        return Err("shell command has too many or oversized arguments");
+    }
+    Ok(words)
+}
+
+fn workspace_command_policy(argv: &[String]) -> Result<(), &'static str> {
+    let first = argv.first().map(String::as_str).unwrap_or("");
+    match first {
+        "pwd" if argv[1..].iter().all(|arg| matches!(arg.as_str(), "-L" | "-P")) => Ok(()),
+        "ls" if argv.len() == 1 => Ok(()),
+        "echo" if argv[1..]
+            .iter()
+            .all(|arg| !arg.starts_with('-') && !arg.chars().any(char::is_control)) =>
+        {
+            Ok(())
+        }
+        "printf"
+            if argv.len() >= 2
+                && !argv[1].contains("%b")
+                && argv[1..]
+                    .iter()
+                    .all(|arg| !arg.chars().any(char::is_control)) =>
+        {
+            Ok(())
+        }
+        "which"
+            if argv.len() >= 2
+                && argv[1..].iter().all(|arg| {
+                    arg == "-a"
+                        || arg.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
+                        })
+                }) =>
+        {
+            Ok(())
+        }
+        "find" => Err("find expressions require confirmation, including -exec and -ok"),
+        "awk" => Err("awk programs require confirmation because they can launch subprocesses"),
+        "sed" => Err("sed programs require confirmation because GNU sed can execute commands"),
+        "cat" | "head" | "tail" | "grep" | "rg" | "file" | "ps" | "df" | "du" | "wc" => {
+            Err("shell-based file or process inspection requires confirmation; use a scoped tool for automatic access")
+        }
+        "git" | "cargo" | "npm" | "pnpm" | "code_exec" => {
+            Err("commands that can execute repository code require confirmation")
+        }
+        "cd" | "pushd" | "popd" => Err("persistent shell state changes require confirmation"),
+        _ => Err("this command has no automatic workspace argument policy"),
+    }
+}
+
+fn render_restricted_command(argv: &[String]) -> String {
+    let quoted = argv
+        .iter()
+        .map(|argument| format!("'{}'", argument.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("command -p {quoted}")
+}
+
+fn provider_mesh_permission(cfg: &PermissionsConfig, args: &Value) -> PermissionResult {
+    let providers = match args.get("providers") {
+        None | Some(Value::Null) => vec!["ollama", "deepseek"],
+        Some(Value::Array(providers)) if providers.len() <= 3 => {
+            let Some(providers) = providers
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+            else {
+                return PermissionResult::Denied("provider_mesh providers must be strings".into());
+            };
+            providers
+        }
+        Some(Value::Array(_)) => {
+            return PermissionResult::Denied("provider_mesh accepts at most three providers".into())
+        }
+        Some(_) => {
+            return PermissionResult::Denied("provider_mesh providers must be an array".into())
+        }
+    };
+
+    if providers.is_empty() {
+        return PermissionResult::Denied("provider_mesh requires at least one provider".into());
+    }
+
+    let mut confirmation = None;
+    for provider in providers {
+        let host = match provider {
+            "ollama" => "127.0.0.1",
+            "deepseek" => "api.deepseek.com",
+            "openrouter" => "openrouter.ai",
+            _ => {
+                return PermissionResult::Denied(format!(
+                    "unknown provider_mesh provider: {provider}"
+                ))
+            }
+        };
+        match cfg.can_access_network(host) {
+            PermissionResult::Denied(reason) => return PermissionResult::Denied(reason),
+            PermissionResult::Confirm(reason) => confirmation = Some(reason),
+            PermissionResult::Allowed => {}
+        }
+    }
+
+    confirmation.map_or(PermissionResult::Allowed, PermissionResult::Confirm)
+}
+
+fn domain_matches(pattern: &str, host: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    host == pattern || host.ends_with(&format!(".{pattern}"))
 }
 
 fn denied_command_matches(pattern: &str, command: &str) -> bool {
@@ -483,8 +903,33 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+fn resolve_for_policy(path: &Path) -> PathBuf {
+    let normalized = normalize_path(path);
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        return canonical;
+    }
+
+    let mut ancestor = normalized.as_path();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+    }
+    let mut resolved = std::fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    resolved
+}
+
 fn path_within_dir(path: &Path, dir: &str) -> bool {
-    let base = normalize_path(Path::new(dir));
+    let base = resolve_for_policy(Path::new(dir));
     path.starts_with(base)
 }
 
@@ -496,20 +941,51 @@ fn glob_match(pattern: &str, s: &str) -> bool {
         return true;
     }
     if !pattern.contains('*') {
-        return s.contains(pattern) || expand_tilde(pattern) == s;
-    }
-    // Basic glob: prefix* or *suffix or prefix*suffix
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 2 {
-        if pattern.starts_with('*') {
-            return s.ends_with(parts[1]);
+        let pattern_path = Path::new(pattern);
+        if pattern_path.is_absolute() {
+            return Path::new(s).starts_with(pattern_path);
         }
-        if pattern.ends_with('*') {
-            return s.starts_with(parts[0]);
-        }
-        return s.starts_with(parts[0]) && s.ends_with(parts[1]);
+        return Path::new(s)
+            .components()
+            .any(|component| component.as_os_str() == pattern);
     }
-    s.contains(pattern.trim_matches('*'))
+    if Path::new(pattern).is_absolute() || pattern.contains('/') {
+        return wildcard_match(pattern, s);
+    }
+    Path::new(s).components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|value| wildcard_match(pattern, value))
+    })
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut star_index, mut star_value_index) = (None, 0);
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == value[value_index] {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_value_index = value_index;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_value_index += 1;
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 #[cfg(test)]
@@ -520,6 +996,8 @@ mod tests {
     fn secret_paths_are_denied_before_broad_home_allow() {
         let cfg = PermissionsConfig::default();
         let result = cfg.can_read_file(Path::new("/home/x1/.ssh/id_ed25519"));
+        assert!(matches!(result, PermissionResult::Denied(_)));
+        let result = cfg.can_read_file(Path::new("/workspace/.env.production"));
         assert!(matches!(result, PermissionResult::Denied(_)));
     }
 
@@ -546,5 +1024,173 @@ mod tests {
         };
         let result = cfg.can_write_file(Path::new("/Uintellagent/src/../Cargo.toml"));
         assert!(matches!(result, PermissionResult::Allowed));
+    }
+
+    #[test]
+    fn default_policy_has_no_developer_specific_paths() {
+        let encoded = toml::to_string(&PermissionsConfig::default()).unwrap();
+        assert!(!encoded.contains("/Uintellagent"));
+        assert!(!encoded.contains("/home/x1"));
+        assert!(encoded.contains("config_version = 1"));
+    }
+
+    #[test]
+    fn shell_allow_list_requires_command_boundaries_and_confirmation() {
+        let cfg = PermissionsConfig::default();
+        assert!(matches!(
+            cfg.can_execute_shell("git status"),
+            PermissionResult::Confirm(_)
+        ));
+        assert!(matches!(
+            cfg.can_execute_shell("git-malicious status"),
+            PermissionResult::Confirm(_)
+        ));
+        assert!(matches!(
+            cfg.can_execute_shell("git status; curl https://example.com"),
+            PermissionResult::Confirm(_)
+        ));
+        assert!(matches!(
+            cfg.can_execute_shell("git push origin main"),
+            PermissionResult::Confirm(_)
+        ));
+        assert!(matches!(
+            cfg.can_execute_shell("echo 'a|b'"),
+            PermissionResult::Allowed
+        ));
+        assert!(matches!(
+            cfg.can_execute_shell("echo \"a|b\""),
+            PermissionResult::Allowed
+        ));
+        assert!(matches!(
+            cfg.can_execute_shell("git fetch origin"),
+            PermissionResult::Confirm(_)
+        ));
+    }
+
+    #[test]
+    fn shell_expansion_and_interpreter_escape_paths_require_confirmation() {
+        let cfg = PermissionsConfig::default();
+        for command in [
+            "echo $DEEPSEEK_API_KEY",
+            "echo \"$DEEPSEEK_API_KEY\"",
+            "echo ${DEEPSEEK_API_KEY}",
+            "find . -exec sh -c 'id' ;",
+            "find . -execdir id ;",
+            "awk 'BEGIN { system(\"id\") }'",
+            "sed -e 'e id' Cargo.toml",
+            "rg --pre sh pattern",
+        ] {
+            assert!(
+                matches!(cfg.can_execute_shell(command), PermissionResult::Confirm(_)),
+                "expected confirmation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_workspace_commands_are_parsed_and_rendered_as_argv() {
+        let cfg = PermissionsConfig::default();
+        assert!(matches!(
+            cfg.can_execute_shell("echo 'literal $HOME; value'"),
+            PermissionResult::Allowed
+        ));
+        let argv = parse_simple_shell_command("echo 'literal $HOME; value'").unwrap();
+        assert_eq!(
+            render_restricted_command(&argv),
+            "command -p 'echo' 'literal $HOME; value'"
+        );
+    }
+
+    #[test]
+    fn network_policy_matches_only_exact_domains_and_subdomains() {
+        let cfg = PermissionsConfig::default();
+        assert!(matches!(
+            cfg.can_access_network("github.com"),
+            PermissionResult::Allowed
+        ));
+        assert!(matches!(
+            cfg.can_access_network("api.github.com"),
+            PermissionResult::Allowed
+        ));
+        assert!(matches!(
+            cfg.can_access_network("github.com.evil.example"),
+            PermissionResult::Confirm(_)
+        ));
+        assert!(matches!(
+            cfg.can_access_network("git"),
+            PermissionResult::Confirm(_)
+        ));
+    }
+
+    #[test]
+    fn future_permission_versions_fail_validation() {
+        let mut cfg = PermissionsConfig::default();
+        cfg.config_version += 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn alpha_permission_defaults_migrate_without_machine_paths() {
+        let mut cfg = PermissionsConfig::default();
+        cfg.workspace_dirs.push("/Uintellagent".into());
+        cfg.allowed_read_paths
+            .extend(["/home".into(), "/Uintellagent".into()]);
+        cfg.allowed_write_paths
+            .extend(["/Uintellagent".into(), "/home/x1".into(), ".".into()]);
+        cfg.allowed_commands.extend(["env".into(), "curl".into()]);
+        cfg.denied_read_paths.retain(|path| path != ".aws");
+        cfg.migrate_alpha_defaults();
+        let encoded = toml::to_string(&cfg).unwrap();
+        assert!(!encoded.contains("/Uintellagent"));
+        assert!(!encoded.contains("/home/x1"));
+        assert!(!cfg.allowed_read_paths.contains(&"/home".into()));
+        assert!(!cfg.allowed_commands.contains(&"env".into()));
+        assert!(!cfg.allowed_commands.contains(&"curl".into()));
+        assert!(cfg.denied_read_paths.contains(&".aws".into()));
+    }
+
+    #[test]
+    fn provider_mesh_and_unknown_tools_fail_closed() {
+        let cfg = PermissionsConfig::default();
+        assert!(matches!(
+            provider_mesh_permission(&cfg, &serde_json::json!({"prompt": "hello"})),
+            PermissionResult::Allowed
+        ));
+        assert!(matches!(
+            provider_mesh_permission(
+                &cfg,
+                &serde_json::json!({"prompt": "hello", "providers": ["unknown"]})
+            ),
+            PermissionResult::Denied(_)
+        ));
+        assert!(matches!(
+            permission_for_tool_with_config(&cfg, "future_tool", &serde_json::json!({})),
+            PermissionResult::Denied(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_workspace_paths_cannot_escape_policy() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "uintell-permissions-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("outside");
+        symlink("/etc", &link).unwrap();
+        let cfg = PermissionsConfig {
+            workspace_dirs: vec![root.to_string_lossy().into_owned()],
+            allowed_read_paths: Vec::new(),
+            ..PermissionsConfig::default()
+        };
+        assert!(matches!(
+            cfg.can_read_file(&link.join("passwd")),
+            PermissionResult::Denied(_)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

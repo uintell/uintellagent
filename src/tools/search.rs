@@ -4,6 +4,8 @@ use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
+const MAX_SEARCH_RESPONSE_BYTES: usize = 2_000_000;
+
 #[derive(Deserialize)]
 pub struct WebSearchArgs {
     query: String,
@@ -58,8 +60,13 @@ impl Tool for WebSearch {
         let limit = args.limit.unwrap_or(10).min(20);
 
         let client = reqwest::Client::builder()
-            .user_agent("UIntellAgent/0.3 (search)")
+            .user_agent(concat!(
+                "UIntellAgent/",
+                env!("CARGO_PKG_VERSION"),
+                " (search)"
+            ))
             .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| WebSearchError::new(format!("build search client: {error}")))?;
 
@@ -73,16 +80,21 @@ impl Tool for WebSearch {
             .send()
             .await
             .map_err(|error| WebSearchError::new(format!("search DuckDuckGo: {error}")))?;
-        let status = response.status();
+        let response = crate::http_body::read_response(response, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+            .map_err(WebSearchError::new)?;
+        let status = response.status;
         if !status.is_success() {
             return Err(WebSearchError::new(format!(
                 "DuckDuckGo search returned HTTP {status}"
             )));
         }
-        let body = response
-            .text()
-            .await
-            .map_err(|error| WebSearchError::new(format!("read search response: {error}")))?;
+        if response.truncated {
+            return Err(WebSearchError::new(format!(
+                "DuckDuckGo response exceeded {MAX_SEARCH_RESPONSE_BYTES} bytes"
+            )));
+        }
+        let body = String::from_utf8_lossy(&response.bytes);
 
         let results = parse_ddg_html(&body, limit);
 

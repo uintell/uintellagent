@@ -35,10 +35,12 @@ checksums="$dist_dir/SHA256SUMS"
 rm -rf -- "$package_dir"
 rm -f -- "$archive" "$standalone" "$checksums"
 mkdir -p "$package_dir"
+mkdir -p "$package_dir/docs"
 
 install -m 0755 "$binary" "$package_dir/uintell-agent"
 install -m 0755 install.sh "$package_dir/install.sh"
-install -m 0644 README.md LICENSE "$package_dir/"
+install -m 0644 README.md LICENSE SECURITY.md COMPATIBILITY.md CHANGELOG.md "$package_dir/"
+install -m 0644 docs/GATEWAY.md "$package_dir/docs/"
 strip --strip-unneeded "$package_dir/uintell-agent"
 install -m 0755 "$package_dir/uintell-agent" "$standalone"
 

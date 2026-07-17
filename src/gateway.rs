@@ -2,7 +2,7 @@
 //
 // Endpoints:
 //   GET  /health           — health check (no auth)
-//   GET  /ready            — readiness check (DB + provider status)
+//   GET  /ready            — authenticated process readiness
 //   POST /chat             — send message, get JSON response (API key required)
 //
 // Security:
@@ -14,6 +14,7 @@
 //   - CORS: configurable allowed origins
 
 use axum::{
+    extract::DefaultBodyLimit,
     extract::State,
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware,
@@ -37,10 +38,13 @@ const MAX_REQUESTS_PER_MINUTE: u32 = 60;
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 const MAX_MESSAGE_CHARS: usize = 32_000;
 const MAX_SESSION_ID_CHARS: usize = 128;
+const MAX_REQUEST_ID_CHARS: usize = 128;
+const MAX_SESSIONS: usize = 64;
+const MAX_SESSION_MESSAGES: usize = 20;
+const MAX_REQUEST_BYTES: usize = 128 * 1024;
 
 fn api_key() -> Option<String> {
     std::env::var("UINTELL_API_KEY")
-        .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
         .ok()
         .filter(|key| !key.trim().is_empty())
 }
@@ -96,7 +100,14 @@ struct GatewayState<M: CompletionModel> {
     /// Rate limiter: API key → (window_start, count)
     rate_limits: Mutex<HashMap<String, (Instant, u32)>>,
     /// In-memory conversation history keyed by validated session ID.
-    histories: Mutex<HashMap<String, Vec<Message>>>,
+    histories: Mutex<HashMap<String, SessionHistory>>,
+    /// Fixed lock stripes preserve ordering within a session without a growing map.
+    session_gates: [Mutex<()>; MAX_SESSIONS],
+}
+
+struct SessionHistory {
+    messages: Vec<Message>,
+    last_used: Instant,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -123,7 +134,7 @@ async fn auth_middleware<M: CompletionModel>(
         );
     };
 
-    if key != expected {
+    if !constant_time_eq(key.as_bytes(), expected.as_bytes()) {
         return error_response(
             StatusCode::UNAUTHORIZED,
             "UNAUTHORIZED",
@@ -132,21 +143,35 @@ async fn auth_middleware<M: CompletionModel>(
     }
 
     // Rate limiting
-    let mut limits = state.rate_limits.lock().await;
-    let entry = limits.entry(key).or_insert((Instant::now(), 0));
-    if entry.0.elapsed() > Duration::from_secs(60) {
-        *entry = (Instant::now(), 0);
-    }
-    entry.1 += 1;
-    if entry.1 > MAX_REQUESTS_PER_MINUTE {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            &format!("Max {MAX_REQUESTS_PER_MINUTE} requests per minute. Retry after 60s."),
-        );
+    let key_id = blake3::hash(key.as_bytes()).to_hex().to_string();
+    {
+        let mut limits = state.rate_limits.lock().await;
+        let entry = limits.entry(key_id).or_insert((Instant::now(), 0));
+        if entry.0.elapsed() > Duration::from_secs(60) {
+            *entry = (Instant::now(), 0);
+        }
+        entry.1 += 1;
+        if entry.1 > MAX_REQUESTS_PER_MINUTE {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                &format!("Max {MAX_REQUESTS_PER_MINUTE} requests per minute. Retry after 60s."),
+            );
+        }
     }
 
     next.run(request).await
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
 }
 
 fn extract_api_key(headers: &HeaderMap) -> String {
@@ -222,11 +247,8 @@ async fn health<M: CompletionModel>(
 async fn ready<M: CompletionModel + 'static>(
     State(state): State<Arc<GatewayState<M>>>,
 ) -> Json<serde_json::Value> {
-    // Check agent is alive with a quick test
-    let agent = state.agent.lock().await;
-    let ok = agent.prompt("ping").await.is_ok();
     Json(serde_json::json!({
-        "status": if ok { "ready" } else { "degraded" },
+        "status": "ready",
         "provider": state.provider,
     }))
 }
@@ -235,88 +257,131 @@ async fn chat<M: CompletionModel + 'static>(
     State(state): State<Arc<GatewayState<M>>>,
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let request_id = if request_id.is_empty() {
-        uuid_v4()
-    } else {
-        request_id
-    };
+        .filter(|value| valid_request_id(value))
+        .map(str::to_string)
+        .unwrap_or_else(uuid_v4);
 
     if let Err(error) = validate_chat_request(&req) {
-        return Json(ChatResponse {
-            id: request_id,
-            status: "error".into(),
-            response: None,
-            provider: state.provider.clone(),
-            usage: None,
-            error: Some(error),
-        });
-    }
-
-    let agent = state.agent.lock().await;
-    let history = match req.session_id.as_deref() {
-        Some(session_id) => state
-            .histories
-            .lock()
-            .await
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-
-    match tokio::time::timeout(
-        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        agent.prompt(&req.message).history(history).max_turns(12),
-    )
-    .await
-    {
-        Ok(Ok(response)) => {
-            if let Some(session_id) = req.session_id {
-                let mut histories = state.histories.lock().await;
-                let messages = histories.entry(session_id).or_default();
-                messages.push(Message::user(req.message));
-                messages.push(Message::assistant(response.clone()));
-                if messages.len() > 40 {
-                    messages.drain(..messages.len() - 40);
-                }
-            }
+        return (
+            StatusCode::BAD_REQUEST,
             Json(ChatResponse {
                 id: request_id,
-                status: "ok".into(),
-                response: Some(response),
+                status: "error".into(),
+                response: None,
                 provider: state.provider.clone(),
                 usage: None,
-                error: None,
-            })
+                error: Some(error),
+            }),
+        )
+            .into_response();
+    }
+
+    match tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), async {
+        let _session_guard = match req.session_id.as_deref() {
+            Some(session_id) => Some(
+                state.session_gates[session_gate_index(session_id)]
+                    .lock()
+                    .await,
+            ),
+            None => None,
+        };
+        let history = match req.session_id.as_deref() {
+            Some(session_id) => {
+                let mut histories = state.histories.lock().await;
+                histories
+                    .get_mut(session_id)
+                    .map_or_else(Vec::new, |history| {
+                        history.last_used = Instant::now();
+                        history.messages.clone()
+                    })
+            }
+            None => Vec::new(),
+        };
+        let prompt_result = {
+            let agent = state.agent.lock().await;
+            agent
+                .prompt(&req.message)
+                .history(history)
+                .max_turns(12)
+                .await
+        };
+        let response = match prompt_result {
+            Ok(response) => response,
+            Err(error) => return Err(error),
+        };
+        if let Some(session_id) = req.session_id.as_ref() {
+            let mut histories = state.histories.lock().await;
+            if !histories.contains_key(session_id) && histories.len() >= MAX_SESSIONS {
+                if let Some(oldest) = histories
+                    .iter()
+                    .min_by_key(|(_, history)| history.last_used)
+                    .map(|(id, _)| id.clone())
+                {
+                    histories.remove(&oldest);
+                }
+            }
+            let history = histories
+                .entry(session_id.clone())
+                .or_insert_with(|| SessionHistory {
+                    messages: Vec::new(),
+                    last_used: Instant::now(),
+                });
+            history.last_used = Instant::now();
+            history.messages.push(Message::user(req.message.clone()));
+            history.messages.push(Message::assistant(response.clone()));
+            if history.messages.len() > MAX_SESSION_MESSAGES {
+                history
+                    .messages
+                    .drain(..history.messages.len() - MAX_SESSION_MESSAGES);
+            }
         }
-        Ok(Err(e)) => Json(ChatResponse {
+        Ok(response)
+    })
+    .await
+    {
+        Ok(Ok(response)) => Json(ChatResponse {
             id: request_id,
-            status: "error".into(),
-            response: None,
+            status: "ok".into(),
+            response: Some(response),
             provider: state.provider.clone(),
             usage: None,
-            error: Some(ErrorInfo {
-                code: "AGENT_ERROR".into(),
-                message: format!("{e}"),
+            error: None,
+        })
+        .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ChatResponse {
+                id: request_id,
+                status: "error".into(),
+                response: None,
+                provider: state.provider.clone(),
+                usage: None,
+                error: Some(ErrorInfo {
+                    code: "AGENT_ERROR".into(),
+                    message: format!("{e}"),
+                }),
             }),
-        }),
-        Err(_) => Json(ChatResponse {
-            id: request_id,
-            status: "timeout".into(),
-            response: None,
-            provider: state.provider.clone(),
-            usage: None,
-            error: Some(ErrorInfo {
-                code: "TIMEOUT".into(),
-                message: format!("Request exceeded {REQUEST_TIMEOUT_SECS}s timeout"),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(ChatResponse {
+                id: request_id,
+                status: "timeout".into(),
+                response: None,
+                provider: state.provider.clone(),
+                usage: None,
+                error: Some(ErrorInfo {
+                    code: "TIMEOUT".into(),
+                    message: format!("Request exceeded {REQUEST_TIMEOUT_SECS}s timeout"),
+                }),
             }),
-        }),
+        )
+            .into_response(),
     }
 }
 
@@ -353,6 +418,21 @@ fn valid_session_id(session_id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+fn valid_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= MAX_REQUEST_ID_CHARS
+        && request_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
+}
+
+fn session_gate_index(session_id: &str) -> usize {
+    let hash = blake3::hash(session_id.as_bytes());
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(prefix) as usize % MAX_SESSIONS
+}
+
 fn uuid_v4() -> String {
     use std::fmt::Write;
     let mut r: [u8; 16] = rand::random();
@@ -376,12 +456,16 @@ pub async fn serve<M>(agent: Agent<M>, provider: &str, addr: &str) -> anyhow::Re
 where
     M: CompletionModel + Send + 'static,
 {
+    crate::tools::graph::ensure_ready()
+        .await
+        .map_err(anyhow::Error::msg)?;
     let state = Arc::new(GatewayState {
         agent: Mutex::new(agent),
         provider: provider.to_string(),
         start_time: Instant::now(),
         rate_limits: Mutex::new(HashMap::new()),
         histories: Mutex::new(HashMap::new()),
+        session_gates: std::array::from_fn(|_| Mutex::new(())),
     });
 
     let app = Router::new()
@@ -393,6 +477,7 @@ where
             auth_middleware::<M>,
         ))
         .layer(cors_layer())
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -440,5 +525,30 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(id.chars().nth(14), Some('4'));
         assert!(matches!(id.chars().nth(19), Some('8' | '9' | 'a' | 'b')));
+    }
+
+    #[test]
+    fn api_key_comparison_is_length_and_content_sensitive() {
+        assert!(constant_time_eq(b"correct-secret", b"correct-secret"));
+        assert!(!constant_time_eq(b"correct-secret", b"wrong-secret"));
+        assert!(!constant_time_eq(
+            b"correct-secret",
+            b"correct-secret-extra"
+        ));
+    }
+
+    #[test]
+    fn request_ids_are_bounded_and_header_safe() {
+        assert!(valid_request_id("deploy-42:attempt_1"));
+        assert!(!valid_request_id("bad\nheader"));
+        assert!(!valid_request_id(&"x".repeat(MAX_REQUEST_ID_CHARS + 1)));
+    }
+
+    #[test]
+    fn session_gate_selection_is_stable_and_bounded() {
+        let first = session_gate_index("session-a");
+        assert_eq!(first, session_gate_index("session-a"));
+        assert!(first < MAX_SESSIONS);
+        assert!(session_gate_index("session-b") < MAX_SESSIONS);
     }
 }

@@ -12,35 +12,74 @@ use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
-const PATTERNS: &[(&str, &str)] = &[
-    ("agent", "smallest prompt/response agent"),
+const PATTERNS: &[(&str, &str, &str)] = &[
+    ("agent", "demo", "smallest prompt/response agent"),
     (
         "agent_with_tools",
+        "demo",
         "typed tool definitions and tool registry",
     ),
-    ("manual_tool_calls", "explicit tool-call execution"),
-    ("agent_run_stepping", "visible step-by-step agent runtime"),
-    ("agent_with_human_in_the_loop", "interactive tool approval"),
-    ("agent_with_approval_policy", "policy-driven tool gating"),
-    ("agent_with_durable_approval", "resumable approval state"),
-    ("agent_with_memory", "conversation memory"),
-    ("agent_with_memory_streaming", "streamed output with memory"),
-    ("rag", "document/codebase retrieval"),
-    ("rag_dynamic_tools", "embedding-selected tools"),
+    ("manual_tool_calls", "demo", "explicit tool-call execution"),
+    (
+        "agent_run_stepping",
+        "demo",
+        "visible step-by-step agent runtime",
+    ),
+    (
+        "agent_with_human_in_the_loop",
+        "demo",
+        "tool-call policy hook",
+    ),
+    (
+        "agent_with_approval_policy",
+        "demo",
+        "policy-driven tool gating",
+    ),
+    (
+        "agent_with_durable_approval",
+        "product",
+        "resumable approval state",
+    ),
+    ("agent_with_memory", "demo", "conversation memory"),
+    (
+        "agent_with_memory_streaming",
+        "product",
+        "streamed output with memory",
+    ),
+    ("rag", "partial", "document/codebase retrieval"),
+    ("rag_dynamic_tools", "planned", "embedding-selected tools"),
     (
         "rag_dynamic_tools_multi_turn",
+        "planned",
         "dynamic tools across a session",
     ),
-    ("agent_orchestrator", "planner/orchestrator workflow"),
-    ("agent_parallelization", "parallel specialist agents"),
-    ("agent_routing", "route prompts to specialist flows"),
-    ("agent_prompt_chaining", "multi-stage task chains"),
-    ("multi_agent", "planner/coder/reviewer/tester architecture"),
-    ("agent_with_agent_tool", "agent-as-tool composition"),
-    ("reasoning_loop", "explicit planner/executor loop"),
-    ("rmcp", "MCP tool integration"),
+    (
+        "agent_orchestrator",
+        "product",
+        "planner/orchestrator workflow",
+    ),
+    (
+        "agent_parallelization",
+        "planned",
+        "parallel specialist agents",
+    ),
+    ("agent_routing", "demo", "route prompts to specialist flows"),
+    ("agent_prompt_chaining", "demo", "multi-stage task chains"),
+    ("multi_agent", "demo", "planner/reviewer agent roles"),
+    (
+        "agent_with_agent_tool",
+        "planned",
+        "agent-as-tool composition",
+    ),
+    (
+        "reasoning_loop",
+        "product",
+        "explicit planner/executor loop",
+    ),
+    ("rmcp", "planned", "MCP tool integration"),
     (
         "rig-surrealdb/vector_search_surreal",
+        "partial",
         "SurrealDB vector memory",
     ),
 ];
@@ -173,9 +212,9 @@ async fn main() -> Result<()> {
 }
 
 fn print_catalog() {
-    println!("== Rig examples as one UIntellAgent integration map ==");
-    for (name, purpose) in PATTERNS {
-        println!("{name:36} {purpose}");
+    println!("== Rig examples and UIntellAgent capability status ==");
+    for (name, status, purpose) in PATTERNS {
+        println!("{name:36} {status:8} {purpose}");
     }
 }
 
@@ -361,11 +400,10 @@ async fn multi_agent_plan(client: &deepseek::Client) -> Result<()> {
 }
 
 fn graph_and_rag_notes() {
-    section("graph, rag, surrealdb, mcp notes");
-    println!("SurrealDB vector memory maps to rig/crates/rig-surrealdb/examples.");
-    println!("RAG maps to rig/examples/rag and rag_dynamic_tools_multi_turn.");
-    println!("MCP maps to rig/examples/rmcp.");
-    println!("Provider-specific examples map to future feature-gated examples.");
+    section("graph, retrieval, and MCP status");
+    println!("SurrealDB graph memory is active in the UIntellAgent product runtime.");
+    println!("Code/file retrieval is active; embedding-selected dynamic tools are planned.");
+    println!("MCP and agent-as-tool composition are planned and are not claimed as active.");
 }
 
 fn section(name: &str) {
