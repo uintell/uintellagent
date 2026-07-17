@@ -1732,7 +1732,7 @@ fn graph_metrics(app: &App) -> (HashMap<String, usize>, usize, usize, usize) {
 }
 
 fn metric_bar(label: &str, count: usize, max: usize, color: Color) -> Line<'static> {
-    let width = if max == 0 { 0 } else { count * 24 / max };
+    let width = count.saturating_mul(24).checked_div(max).unwrap_or(0);
     Line::from(vec![
         Span::styled(format!(" {label:<18}"), Style::default().fg(GRAY)),
         Span::styled("█".repeat(width), Style::default().fg(color)),
