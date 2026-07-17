@@ -1,0 +1,12 @@
+/target
+/rig
+/.uintell
+/.env
+/.env.*
+!/.env.example
+/hello.c
+/mandala.svg
+*.log
+*.swp
+*.swo
+.DS_Store

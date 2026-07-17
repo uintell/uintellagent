@@ -1,0 +1,87 @@
+[package]
+name = "uintell-agent"
+version = "0.3.0"
+edition = "2021"
+description = "UIntell Agent — Rust-native AI agent with provider mesh, graph memory, zero-alloc tools"
+license = "MIT"
+repository = "https://github.com/uintell/uintellagent"
+homepage = "https://uintell.org"
+readme = "README.md"
+rust-version = "1.94"
+keywords = ["ai", "agent", "tui", "surrealdb", "rig"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# Rig agent framework
+rig-core = { git = "https://github.com/0xPlaygrounds/rig.git", rev = "562353af04cb791b610864decead98099498b79d" }
+
+# Graph memory — SurrealDB
+surrealdb = "3"
+
+# Gateway
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async
+futures = "0.3"
+tokio-stream = "0.1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Crypto
+chacha20poly1305 = "0.10"
+blake3 = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+libc = "0.2"
+rand = "0.8"
+
+# HTTP (for gateway, browser, search)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+urlencoding = "2"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = "0.7"
+unicode-width = "0.2"
+similar = "2"
+url = "2"
+
+[[example]]
+name = "rig_tool_calling"
+path = "examples/rig_tool_calling.rs"
+
+[[example]]
+name = "rig_visible_steps"
+path = "examples/rig_visible_steps.rs"
+
+[[example]]
+name = "rig_approval_policy"
+path = "examples/rig_approval_policy.rs"
+
+[[example]]
+name = "rig_memory"
+path = "examples/rig_memory.rs"
+
+[[example]]
+name = "rig_pattern_catalog"
+path = "examples/rig_pattern_catalog.rs"
+
+[[example]]
+name = "rig_all_in_one"
+path = "examples/rig_all_in_one.rs"
