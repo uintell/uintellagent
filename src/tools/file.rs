@@ -3,7 +3,7 @@ use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -15,6 +15,7 @@ pub struct FileChange {
 }
 
 static FILE_CHANGES: LazyLock<Mutex<Vec<FileChange>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 
 pub(crate) fn take_file_changes() -> Vec<FileChange> {
     FILE_CHANGES
@@ -117,8 +118,25 @@ impl Tool for FileRead {
             return Ok(reason);
         }
 
-        let content = std::fs::read_to_string(&args.path).map_err(|error| FileReadError {
-            message: format!("read {}: {error}", args.path),
+        let file = std::fs::File::open(&args.path).map_err(|error| FileReadError {
+            message: format!("open {}: {error}", args.path),
+        })?;
+        let mut bytes = Vec::new();
+        file.take((MAX_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| FileReadError {
+                message: format!("read {}: {error}", args.path),
+            })?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(FileReadError {
+                message: format!(
+                    "{} exceeds the {} byte file_read limit",
+                    args.path, MAX_FILE_BYTES
+                ),
+            });
+        }
+        let content = String::from_utf8(bytes).map_err(|_| FileReadError {
+            message: format!("{} is not valid UTF-8 text", args.path),
         })?;
         let lines: Vec<&str> = content.lines().collect();
 
@@ -188,6 +206,11 @@ impl Tool for FileWrite {
         let permission_args = json!({ "path": &args.path }).to_string();
         if let Err(reason) = crate::permissions::enforce_tool_call(Self::NAME, &permission_args) {
             return Ok(reason);
+        }
+        if args.content.len() > MAX_FILE_BYTES {
+            return Err(FileWriteError::new(format!(
+                "content exceeds the {MAX_FILE_BYTES} byte file_write limit"
+            )));
         }
 
         if let Some(parent) = path

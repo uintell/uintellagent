@@ -97,8 +97,8 @@ impl Tool for Terminal {
         // Execute
         match crate::session::exec(&args.command, timeout_secs).await {
             Ok(result) => {
-                let stdout_truncated = result.stdout.contains("(truncated at 50000 bytes)");
-                let stderr_truncated = result.stderr.contains("(truncated at 10000 bytes)");
+                let stdout_truncated = result.stdout.contains("(truncated at 50000 bytes;");
+                let stderr_truncated = result.stderr.contains("(truncated at 10000 bytes;");
                 let output = TerminalOutput {
                     success: result.exit_code == 0,
                     exit_code: result.exit_code,

@@ -4,6 +4,8 @@ use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 
+const MAX_RESPONSE_BYTES: usize = 1_000_000;
+
 #[derive(Deserialize)]
 pub struct BrowserArgs {
     url: String,
@@ -57,9 +59,33 @@ impl Tool for Browser {
             return Ok(reason);
         }
 
+        let initial_host = url::Url::parse(&args.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_default();
+        let redirect_permissions = crate::permissions::PermissionsConfig::load();
         let client = reqwest::Client::builder()
-            .user_agent("UIntellAgent/0.3")
+            .user_agent(concat!("UIntellAgent/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.error(std::io::Error::other("too many redirects"));
+                }
+                let Some(host) = attempt.url().host_str() else {
+                    return attempt.stop();
+                };
+                if !matches!(attempt.url().scheme(), "http" | "https") {
+                    return attempt.stop();
+                }
+                if host.eq_ignore_ascii_case(&initial_host) {
+                    return attempt.follow();
+                }
+                match redirect_permissions.can_access_network(host) {
+                    crate::permissions::PermissionResult::Allowed => attempt.follow(),
+                    crate::permissions::PermissionResult::Denied(_)
+                    | crate::permissions::PermissionResult::Confirm(_) => attempt.stop(),
+                }
+            }))
             .build()
             .map_err(|error| BrowserError::new(format!("build HTTP client: {error}")))?;
 
@@ -68,19 +94,28 @@ impl Tool for Browser {
             .send()
             .await
             .map_err(|error| BrowserError::new(format!("fetch {}: {error}", args.url)))?;
-        let status = resp.status();
-        let body = resp
-            .text()
+        let response = crate::http_body::read_response(resp, MAX_RESPONSE_BYTES)
             .await
-            .map_err(|error| BrowserError::new(format!("read {} response: {error}", args.url)))?;
+            .map_err(BrowserError::new)?;
+        let status = response.status;
+        let body = String::from_utf8_lossy(&response.bytes);
 
         if args.text_only {
             let text = strip_html(&body);
-            Ok(format!("[HTTP {status}]\n{text}"))
+            let suffix = if response.truncated {
+                format!("\n... (response truncated at {MAX_RESPONSE_BYTES} bytes)")
+            } else {
+                String::new()
+            };
+            Ok(format!("[HTTP {status}]\n{text}{suffix}"))
         } else {
             let original_bytes = body.len();
             let (body, truncated) = truncate_chars(&body, 100_000);
-            Ok(if truncated {
+            Ok(if response.truncated {
+                format!(
+                    "[HTTP {status}] {body}... (response truncated at {MAX_RESPONSE_BYTES} bytes)"
+                )
+            } else if truncated {
                 format!(
                     "[HTTP {status}] {body}... (truncated from {} bytes)",
                     original_bytes

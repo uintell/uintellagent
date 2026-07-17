@@ -136,7 +136,7 @@ pub const CAPABILITIES: &[Capability] = &[
 ];
 
 pub fn print_capabilities() {
-    println!("UIntellAgent Rig capability map\n");
+    println!("UIntellAgent Rig capability status map\n");
     for cap in CAPABILITIES {
         println!(
             "{:<27} {:<8} {:<48} from {}",
