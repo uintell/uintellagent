@@ -2,6 +2,45 @@
 
 Rust-native AI agent with a TUI, HTTP gateway, tool execution, provider mesh, and SurrealDB graph memory.
 
+## Install
+
+The first public alpha supports Linux on x86-64. Download and verify the
+release archive:
+
+```bash
+version=0.3.0-alpha.1
+asset="uintell-agent-${version}-x86_64-unknown-linux-gnu"
+base_url="https://github.com/uintell/uintellagent/releases/download/v${version}"
+
+curl --fail --location --remote-name "${base_url}/${asset}.tar.gz"
+curl --fail --location --remote-name "${base_url}/SHA256SUMS"
+sha256sum --ignore-missing --check SHA256SUMS
+tar -xzf "${asset}.tar.gz"
+cd "$asset"
+./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+uintell-agent doctor
+```
+
+The installer copies the binary to `~/.local/bin` by default. Set
+`UINTELL_INSTALL_DIR` to choose another location. Release files and notes are
+available on the [Releases page](https://github.com/uintell/uintellagent/releases).
+
+Graph memory requires the `surreal` CLI in `PATH`. Sandboxed code execution
+requires `/usr/bin/bwrap`. DeepSeek requires `DEEPSEEK_API_KEY`; local models
+can be selected with `--ollama`.
+
+## Build From Source
+
+Rust 1.94 or newer is required:
+
+```bash
+git clone https://github.com/uintell/uintellagent.git
+cd uintellagent
+cargo build --release --locked
+./target/release/uintell-agent --version
+```
+
 ## Safety Baseline
 
 - Tool calls pass through a shared permission engine.
@@ -14,7 +53,7 @@ Rust-native AI agent with a TUI, HTTP gateway, tool execution, provider mesh, an
 ## Commands
 
 ```bash
-cargo fmt -- --check
+cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo run -- doctor

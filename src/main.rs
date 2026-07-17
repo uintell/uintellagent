@@ -1,4 +1,4 @@
-// UIntell Agent v0.3 — Rust-native AI agent with graph memory, provider mesh, gateway
+// UIntell Agent — Rust-native AI agent with graph memory, provider mesh, gateway
 //
 // Default provider: DeepSeek (reads DEEPSEEK_API_KEY from env)
 mod confirm;
@@ -29,7 +29,11 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "uintell", about = "Rust agent that beats Hermes")]
+#[command(
+    name = "uintell-agent",
+    version,
+    about = "Rust-native AI agent with a TUI, tools, and graph memory"
+)]
 struct Cli {
     #[arg(short, long)]
     prompt: Option<String>,

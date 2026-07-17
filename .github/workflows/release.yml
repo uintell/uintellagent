@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ "$GITHUB_REF_NAME" != "v${package_version}" ]]; then
+            printf 'tag %s does not match Cargo version %s\n' "$GITHUB_REF_NAME" "$package_version" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package release
+        run: ./scripts/package-release.sh "$GITHUB_REF_NAME" target/release/uintell-agent x86_64-unknown-linux-gnu dist
+
+      - name: Smoke-test release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          base="uintell-agent-${version}-x86_64-unknown-linux-gnu"
+          "dist/${base}" --version
+          "dist/${base}" --help >/dev/null
+          tar -tzf "dist/${base}.tar.gz"
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+          )
+          file "dist/${base}"
+          ldd "dist/${base}"
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          base="uintell-agent-${version}-x86_64-unknown-linux-gnu"
+          notes_file="docs/releases/${GITHUB_REF_NAME}.md"
+          release_flags=()
+          notes_flags=(--generate-notes)
+
+          if [[ "$version" == *-* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          if [[ -f "$notes_file" ]]; then
+            notes_flags=(--notes-file "$notes_file")
+          fi
+
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/${base}#Standalone Linux x86-64 binary" \
+            "dist/${base}.tar.gz#Linux x86-64 archive with installer" \
+            "dist/SHA256SUMS#SHA-256 checksums" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "UIntell Agent $GITHUB_REF_NAME" \
+            "${notes_flags[@]}" \
+            "${release_flags[@]}"

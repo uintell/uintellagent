@@ -2,19 +2,19 @@ name: CI
 
 on:
   push:
+    branches:
+      - "**"
   pull_request:
 
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - run: cargo fmt --check
-      - run: cargo check
-      - run: cargo test -- --test-threads=1
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo check --locked
+      - run: cargo test --locked -- --test-threads=1
+      - run: cargo clippy --all-targets --locked -- -D warnings
