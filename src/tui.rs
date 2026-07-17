@@ -3988,7 +3988,12 @@ fn cancel_agent_run<M: CompletionModel>(app: &mut App<M>) -> bool {
     was_running
 }
 
-fn submit_chat<M: CompletionModel>(app: &mut App<M>) -> Option<String> {
+enum ChatSubmission {
+    Prompt(String),
+    Exit,
+}
+
+fn submit_chat<M: CompletionModel>(app: &mut App<M>) -> Option<ChatSubmission> {
     let text = app.input.lines().join("\n");
     app.input = chat_input(Vec::new());
     if text.is_empty() {
@@ -4006,7 +4011,7 @@ fn submit_chat<M: CompletionModel>(app: &mut App<M>) -> Option<String> {
     if text.starts_with('/') {
         let q = handle_chat_cmd(app, &text);
         if q {
-            return Some(String::new());
+            return Some(ChatSubmission::Exit);
         }
         return None;
     }
@@ -4021,7 +4026,7 @@ fn submit_chat<M: CompletionModel>(app: &mut App<M>) -> Option<String> {
     app.streaming_text.clear();
     app.active_tool = None;
     app.tool_args.clear();
-    Some(text)
+    Some(ChatSubmission::Prompt(text))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -4501,12 +4506,11 @@ async fn run_loop<M: CompletionModel + 'static>(
                                 if app.thinking {
                                     continue;
                                 }
-                                if let Some(p) = submit_chat(app) {
-                                    if p.is_empty() {
+                                if let Some(submission) = submit_chat(app) {
+                                    let ChatSubmission::Prompt(prompt_text) = submission else {
                                         break;
-                                    }
+                                    };
                                     let history = app.chat_history.clone();
-                                    let prompt_text = p.clone();
                                     app.chat_history.push(RigMessage::user(prompt_text.clone()));
                                     app.active_run = Some(spawn_stream(
                                         app.agent.clone(),

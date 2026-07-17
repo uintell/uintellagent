@@ -186,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Created skill: {name}");
                 println!(
                     "Edit: {}",
-                    skills::skills_dir().join(&name).join("SKILL.md").display()
+                    skills::skills_dir()?.join(&name).join("SKILL.md").display()
                 );
                 println!("Enable: uintell-agent --skill {name} --tui");
                 return Ok(());
@@ -676,27 +676,31 @@ async fn run_doctor(use_ollama: bool, model: &str) -> anyhow::Result<()> {
         Err(error) => report.fail("graph memory", error),
     }
 
-    let permissions_path = permissions::config_path();
     let permissions_config = permissions::PermissionsConfig::load();
-    match std::fs::read_to_string(&permissions_path)
-        .map_err(anyhow::Error::from)
-        .and_then(|value| {
-            let config = toml::from_str::<permissions::PermissionsConfig>(&value)?;
-            config.validate().map_err(anyhow::Error::msg)?;
-            Ok(config)
-        }) {
-        Ok(_) => report.ok(
-            "permissions",
-            format!(
-                "{:?} · {}",
-                permissions_config.mode,
-                permissions_path.display()
-            ),
-        ),
-        Err(error) => report.fail(
-            "permissions",
-            format!("{} is invalid: {error}", permissions_path.display()),
-        ),
+    match permissions::config_path() {
+        Ok(permissions_path) => {
+            match std::fs::read_to_string(&permissions_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|value| {
+                    let config = toml::from_str::<permissions::PermissionsConfig>(&value)?;
+                    config.validate().map_err(anyhow::Error::msg)?;
+                    Ok(config)
+                }) {
+                Ok(_) => report.ok(
+                    "permissions",
+                    format!(
+                        "{:?} · {}",
+                        permissions_config.mode,
+                        permissions_path.display()
+                    ),
+                ),
+                Err(error) => report.fail(
+                    "permissions",
+                    format!("{} is invalid: {error}", permissions_path.display()),
+                ),
+            }
+        }
+        Err(error) => report.fail("permissions", error),
     }
 
     match permissions::permission_for_tool(

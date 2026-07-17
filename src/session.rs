@@ -17,7 +17,8 @@ use tokio::time::timeout;
 
 static SESSION: std::sync::LazyLock<Arc<Mutex<Option<Session>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(None)));
-const MAX_CAPTURE_FILE_BLOCKS: u64 = 131_072;
+const MAX_STDOUT_BYTES: usize = 50_000;
+const MAX_STDERR_BYTES: usize = 10_000;
 
 pub async fn get_or_create_session() -> anyhow::Result<()> {
     let mut s = SESSION.lock().await;
@@ -44,10 +45,10 @@ pub async fn kill_session() {
         // Graceful: send exit, wait 2s, then kill.
         let _ = sess.stdin.write_all(b"exit\n").await;
         let _ = sess.stdin.flush().await;
-        if tokio::time::timeout(Duration::from_secs(2), sess.child.wait())
-            .await
-            .is_err()
-        {
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(2), sess.child.wait()).await,
+            Ok(Ok(_))
+        ) {
             let _ = sess.child.start_kill();
             let _ = sess.child.wait().await;
         }
@@ -96,8 +97,8 @@ impl Session {
         let mut command = Command::new("bash");
         command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
@@ -138,19 +139,27 @@ impl Session {
         let ec_file_quoted = shell_quote(&ec_file.to_string_lossy());
         let cwd_file_quoted = shell_quote(&cwd_file.to_string_lossy());
         let exit_trap = shell_quote(&format!(
-            "ec=$?; echo $ec > {ec_file_quoted}; pwd > {cwd_file_quoted}"
+            "ec=$?; exec 8>&- 9>&-; builtin printf '%s\\n' \"$ec\" > {ec_file_quoted}; builtin pwd > {cwd_file_quoted}"
         ));
 
         // Braces execute in the persistent shell, so `cd` and exports survive.
-        // The EXIT trap still records a result if the command exits the shell.
+        // Process substitutions retain a bounded prefix and drain the remainder.
         let full_cmd = format!(
-            "ulimit -f {MAX_CAPTURE_FILE_BLOCKS} 2>/dev/null || true\n\
-             trap {exit_trap} EXIT\n\
-             {{\n{command}\n}} > {out_file_quoted} 2> {err_file_quoted}\n\
+            "builtin pwd > {cwd_file_quoted}\n\
+             exec 8> >({{ exec 8>&- 9>&-; command -p head -c {} > {out_file_quoted}; command -p cat >/dev/null; }})\n\
+             uintell_out_pid=$!\n\
+             exec 9> >({{ exec 8>&- 9>&-; command -p head -c {} > {err_file_quoted}; command -p cat >/dev/null; }})\n\
+             uintell_err_pid=$!\n\
+             builtin trap {exit_trap} EXIT\n\
+             {{\n{command}\n}} >&8 2>&9\n\
              ec=$?\n\
-             trap - EXIT\n\
-             echo $ec > {ec_file_quoted}\n\
-             pwd > {cwd_file_quoted}\n",
+             exec 8>&- 9>&-\n\
+             builtin wait \"$uintell_out_pid\" \"$uintell_err_pid\" 2>/dev/null || true\n\
+             builtin trap - EXIT\n\
+             builtin printf '%s\\n' \"$ec\" > {ec_file_quoted}\n\
+             builtin pwd > {cwd_file_quoted}\n",
+            MAX_STDOUT_BYTES + 1,
+            MAX_STDERR_BYTES + 1,
         );
         self.stdin.write_all(full_cmd.as_bytes()).await?;
         self.stdin.flush().await?;
@@ -161,14 +170,19 @@ impl Session {
                 if tokio::fs::metadata(&ec_file).await.is_ok() {
                     // File exists — command is done. Small delay for flush.
                     tokio::time::sleep(Duration::from_millis(20)).await;
-                    break;
+                    return Ok::<Option<i32>, std::io::Error>(None);
+                }
+                if let Some(status) = self.child.try_wait()? {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    return Ok(Some(exit_status_code(status)));
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
 
-        match timeout(Duration::from_secs(timeout_secs), wait_future).await {
-            Ok(()) => {}
+        let shell_exit_code = match timeout(Duration::from_secs(timeout_secs), wait_future).await {
+            Ok(Ok(code)) => code,
+            Ok(Err(error)) => return Err(ExecError::Io(error)),
             Err(_) => {
                 #[cfg(unix)]
                 if let Some(pid) = self.child.id() {
@@ -184,15 +198,16 @@ impl Session {
                 let _ = tokio::fs::remove_dir_all(old_temp_dir).await;
                 return Err(ExecError::Timeout(timeout_secs));
             }
-        }
+        };
 
         // Read results
-        let stdout = read_limited(&out_file, 50_000).await;
-        let stderr = read_limited(&err_file, 10_000).await;
+        let stdout = read_limited(&out_file, MAX_STDOUT_BYTES).await;
+        let stderr = read_limited(&err_file, MAX_STDERR_BYTES).await;
         let exit_code = tokio::fs::read_to_string(&ec_file)
             .await
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
+            .or(shell_exit_code)
             .unwrap_or(-1);
         let cwd = tokio::fs::read_to_string(&cwd_file)
             .await
@@ -202,7 +217,7 @@ impl Session {
         self.cwd = Some(cwd.clone());
         cleanup(&out_file, &err_file, &ec_file, &cwd_file).await;
 
-        if self.child.try_wait()?.is_some() {
+        if shell_exit_code.is_some() || self.child.try_wait()?.is_some() {
             let old_temp_dir = self.temp_dir.clone();
             *self = Session::spawn()?;
             let _ = tokio::fs::remove_dir_all(old_temp_dir).await;
@@ -216,6 +231,19 @@ impl Session {
             cwd,
         })
     }
+}
+
+fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map_or(-1, |signal| 128 + signal)
+    }
+    #[cfg(not(unix))]
+    -1
 }
 
 impl Drop for Session {
@@ -346,6 +374,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_replacing_the_shell_completes_and_restarts_the_session() {
+        let _guard = TEST_LOCK.lock().await;
+        setup().await;
+        get_or_create_session().await.expect("create session");
+        let replaced = exec("exec true", 5).await.expect("exec true");
+        assert_eq!(replaced.exit_code, 0);
+        let next = exec("printf restarted", 5)
+            .await
+            .expect("replacement session");
+        assert_eq!(next.stdout, "restarted");
+    }
+
+    #[tokio::test]
     async fn test_session_timeout() {
         let _guard = TEST_LOCK.lock().await;
         setup().await;
@@ -392,5 +433,26 @@ mod tests {
         let output = read_limited(&path, 3).await;
         assert!(output.contains("truncated at 3 bytes"));
         tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_limits_do_not_limit_files_written_by_commands() {
+        let _guard = TEST_LOCK.lock().await;
+        setup().await;
+        get_or_create_session().await.expect("create session");
+        let path = std::env::temp_dir().join(format!(
+            "uintell-large-write-{}-{:x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let command = format!(
+            "head -c 1000000 /dev/zero > {}; head -c 60000 /dev/zero; head -c 20000 /dev/zero >&2",
+            shell_quote(&path.to_string_lossy())
+        );
+        let result = exec(&command, 5).await.expect("large output command");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1_000_000);
+        assert!(result.stdout.contains("truncated at 50000 bytes"));
+        assert!(result.stderr.contains("truncated at 10000 bytes"));
+        std::fs::remove_file(path).unwrap();
     }
 }

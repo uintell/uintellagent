@@ -19,6 +19,9 @@ Advisories page. Do not open a public issue for an undisclosed vulnerability.
 - Code execution requires `bubblewrap` unless explicitly overridden.
 - File reads deny common secret paths such as SSH keys and private key files.
 - Permission files with invalid or unsupported versions fail closed.
+- Workspace shell auto-approval is limited to argument-validated commands;
+  expansion, redirection, interpreters, repository code, and filesystem
+  inspection require confirmation.
 - Release archives are checksummed and receive signed GitHub build provenance.
 
 ## Do Not Expose Publicly Without

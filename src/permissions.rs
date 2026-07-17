@@ -26,7 +26,8 @@ pub struct PermissionsConfig {
     /// Directories where writes are allowed (workspace mode)
     #[serde(default)]
     pub workspace_dirs: Vec<String>,
-    /// Shell commands allowed (regex patterns, workspace + full mode)
+    /// Shell command prefixes eligible for automatic execution in workspace mode.
+    /// Shell syntax and command-specific argument policies still apply.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
     /// Shell commands always denied
@@ -161,7 +162,13 @@ impl Default for PermissionsConfig {
 
 impl PermissionsConfig {
     pub fn load() -> Self {
-        let path = config_path();
+        let path = match config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("UIntell permissions are unavailable: {error}; using read-only policy");
+                return Self::fail_closed();
+            }
+        };
         if path.exists() {
             match std::fs::read_to_string(&path).map_err(|error| error.to_string()) {
                 Ok(content) => match toml::from_str::<Self>(&content) {
@@ -289,6 +296,9 @@ impl PermissionsConfig {
         if self.mode == PermissionMode::ReadOnly {
             return PermissionResult::Denied("read-only mode: no shell access".into());
         }
+        if command.len() > 64 * 1024 {
+            return PermissionResult::Denied("shell command exceeds the 65536 byte limit".into());
+        }
         // Check denied first
         for pattern in &self.denied_commands {
             if denied_command_matches(pattern, command) {
@@ -297,12 +307,11 @@ impl PermissionsConfig {
                 ));
             }
         }
-        if has_unquoted_shell_control(command) {
-            return PermissionResult::Confirm(
-                "shell chaining, substitution, or redirection requires confirmation".into(),
-            );
-        }
-        if self.confirm_destructive && requires_shell_confirmation(command) {
+        let argv = match parse_simple_shell_command(command) {
+            Ok(argv) => argv,
+            Err(reason) => return PermissionResult::Confirm(reason.into()),
+        };
+        if self.confirm_destructive && requires_shell_confirmation(&argv) {
             return PermissionResult::Confirm(format!(
                 "state-changing or privileged shell command requires confirmation: {command}"
             ));
@@ -312,12 +321,17 @@ impl PermissionsConfig {
             return PermissionResult::Allowed;
         }
         // Workspace mode: check allow list
-        for pattern in &self.allowed_commands {
-            if command_pattern_matches(pattern, command) {
-                return PermissionResult::Allowed;
-            }
+        if !self
+            .allowed_commands
+            .iter()
+            .any(|pattern| command_pattern_matches(pattern, &argv))
+        {
+            return PermissionResult::Confirm(format!("command not in allow-list: {command}"));
         }
-        PermissionResult::Confirm(format!("command not in allow-list: {command}"))
+        match workspace_command_policy(&argv) {
+            Ok(()) => PermissionResult::Allowed,
+            Err(reason) => PermissionResult::Confirm(reason.into()),
+        }
     }
 
     pub fn can_read_file(&self, path: &Path) -> PermissionResult {
@@ -481,11 +495,39 @@ pub fn enforce_tool_call(tool_name: &str, args_json: &str) -> Result<(), String>
     }
 }
 
-pub(crate) fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".uintell")
-        .join("permissions.toml")
+pub fn authorize_terminal_command(command: &str, args_json: &str) -> Result<String, String> {
+    let cfg = PermissionsConfig::load();
+    match cfg.can_execute_shell(command) {
+        PermissionResult::Allowed if cfg.mode == PermissionMode::Workspace => {
+            let argv = parse_simple_shell_command(command)
+                .map_err(|reason| format!("PERMISSION DENIED: {reason}"))?;
+            Ok(render_restricted_command(&argv))
+        }
+        PermissionResult::Allowed => Ok(command.to_string()),
+        PermissionResult::Denied(reason) => Err(format!("PERMISSION DENIED: {reason}")),
+        PermissionResult::Confirm(reason) => {
+            let key = approval_key("terminal", args_json);
+            let approved = APPROVED_CALLS
+                .lock()
+                .map(|mut approvals| approvals.remove(&key))
+                .unwrap_or(false);
+            if approved {
+                Ok(command.to_string())
+            } else {
+                Err(format!("CONFIRMATION REQUIRED: {reason}"))
+            }
+        }
+    }
+}
+
+pub(crate) fn config_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_string())?;
+    if !home.is_absolute() {
+        return Err("HOME must be an absolute path".into());
+    }
+    Ok(home.join(".uintell").join("permissions.toml"))
 }
 
 fn write_default_config(path: &Path, config: &PermissionsConfig) -> std::io::Result<()> {
@@ -531,11 +573,11 @@ fn write_default_config(path: &Path, config: &PermissionsConfig) -> std::io::Res
 
 fn expand_tilde(path: &str) -> String {
     if path.starts_with('~') {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-        path.replacen('~', &home, 1)
-    } else {
-        path.to_string()
+        if let Some(home) = std::env::var_os("HOME").filter(|home| Path::new(home).is_absolute()) {
+            return path.replacen('~', &home.to_string_lossy(), 1);
+        }
     }
+    path.to_string()
 }
 
 fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -570,9 +612,8 @@ fn approval_key(tool_name: &str, args_json: &str) -> String {
     format!("{tool_name}:{}", blake3::hash(subject.as_bytes()))
 }
 
-fn requires_shell_confirmation(command: &str) -> bool {
-    let trimmed = command.trim_start();
-    let first = trimmed.split_whitespace().next().unwrap_or("");
+fn requires_shell_confirmation(argv: &[String]) -> bool {
+    let first = argv.first().map(String::as_str).unwrap_or("");
     if matches!(
         first,
         "rm" | "mv"
@@ -607,89 +648,173 @@ fn requires_shell_confirmation(command: &str) -> bool {
             | "rustc"
             | "env"
             | "printenv"
+            | "code_exec"
+            | "find"
+            | "sed"
+            | "awk"
+            | "cargo"
+            | "npm"
+            | "pnpm"
+            | "git"
     ) {
         return true;
     }
-
-    let second = trimmed.split_whitespace().nth(1).unwrap_or("");
-    (first == "git"
-        && !matches!(
-            second,
-            "" | "status"
-                | "diff"
-                | "log"
-                | "show"
-                | "rev-parse"
-                | "ls-files"
-                | "grep"
-                | "blame"
-                | "shortlog"
-                | "describe"
-                | "name-rev"
-                | "cat-file"
-                | "ls-tree"
-                | "for-each-ref"
-        ))
-        || (matches!(first, "cargo" | "npm" | "pnpm")
-            && matches!(
-                second,
-                "add"
-                    | "install"
-                    | "login"
-                    | "owner"
-                    | "publish"
-                    | "remove"
-                    | "uninstall"
-                    | "update"
-                    | "yank"
-            ))
+    false
 }
 
-fn command_pattern_matches(pattern: &str, command: &str) -> bool {
-    let command = command.trim_start();
-    command == pattern
-        || command
-            .strip_prefix(pattern)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(char::is_whitespace)
+fn command_pattern_matches(pattern: &str, argv: &[String]) -> bool {
+    parse_simple_shell_command(pattern)
+        .ok()
+        .is_some_and(|prefix| !prefix.is_empty() && argv.starts_with(&prefix))
 }
 
-fn has_unquoted_shell_control(command: &str) -> bool {
-    let mut single_quoted = false;
-    let mut double_quoted = false;
-    let mut escaped = false;
-    let mut chars = command.chars().peekable();
-    while let Some(character) = chars.next() {
-        if escaped {
-            escaped = false;
-            continue;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellQuote {
+    Unquoted,
+    Single,
+    Double,
+}
+
+fn parse_simple_shell_command(command: &str) -> Result<Vec<String>, &'static str> {
+    let mut quote = ShellQuote::Unquoted;
+    let mut current = String::new();
+    let mut words = Vec::new();
+    let mut word_started = false;
+
+    for character in command.chars() {
+        if matches!(character, '\0' | '\n' | '\r') {
+            return Err("multiline or NUL shell input requires confirmation");
         }
-        if character == '\\' && !single_quoted {
-            escaped = true;
-            continue;
-        }
-        if character == '\'' && !double_quoted {
-            single_quoted = !single_quoted;
-            continue;
-        }
-        if character == '"' && !single_quoted {
-            double_quoted = !double_quoted;
-            continue;
-        }
-        if single_quoted {
-            continue;
-        }
-        if character == '`' {
-            return true;
-        }
-        if character == '$' && chars.peek() == Some(&'(') {
-            return true;
-        }
-        if !double_quoted && matches!(character, ';' | '&' | '|' | '<' | '>' | '\n' | '\r') {
-            return true;
+        match quote {
+            ShellQuote::Single => {
+                if character == '\'' {
+                    quote = ShellQuote::Unquoted;
+                } else {
+                    current.push(character);
+                }
+                word_started = true;
+            }
+            ShellQuote::Double => {
+                if character == '"' {
+                    quote = ShellQuote::Unquoted;
+                } else if matches!(character, '$' | '`' | '\\') {
+                    return Err("shell expansion or escaping requires confirmation");
+                } else {
+                    current.push(character);
+                }
+                word_started = true;
+            }
+            ShellQuote::Unquoted => {
+                if character.is_whitespace() {
+                    if word_started {
+                        words.push(std::mem::take(&mut current));
+                        word_started = false;
+                    }
+                } else if character == '\'' {
+                    quote = ShellQuote::Single;
+                    word_started = true;
+                } else if character == '"' {
+                    quote = ShellQuote::Double;
+                    word_started = true;
+                } else if matches!(
+                    character,
+                    '$' | '`'
+                        | '\\'
+                        | ';'
+                        | '&'
+                        | '|'
+                        | '<'
+                        | '>'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '('
+                        | ')'
+                        | '~'
+                        | '!'
+                        | '#'
+                ) {
+                    return Err(
+                        "shell expansion, control syntax, or globbing requires confirmation",
+                    );
+                } else {
+                    current.push(character);
+                    word_started = true;
+                }
+            }
         }
     }
-    false
+
+    if quote != ShellQuote::Unquoted {
+        return Err("unclosed shell quote requires confirmation");
+    }
+    if word_started {
+        words.push(current);
+    }
+    if words.is_empty() {
+        return Err("empty shell command requires confirmation");
+    }
+    if words.len() > 256 || words.iter().any(|word| word.len() > 16 * 1024) {
+        return Err("shell command has too many or oversized arguments");
+    }
+    Ok(words)
+}
+
+fn workspace_command_policy(argv: &[String]) -> Result<(), &'static str> {
+    let first = argv.first().map(String::as_str).unwrap_or("");
+    match first {
+        "pwd" if argv[1..].iter().all(|arg| matches!(arg.as_str(), "-L" | "-P")) => Ok(()),
+        "ls" if argv.len() == 1 => Ok(()),
+        "echo" if argv[1..]
+            .iter()
+            .all(|arg| !arg.starts_with('-') && !arg.chars().any(char::is_control)) =>
+        {
+            Ok(())
+        }
+        "printf"
+            if argv.len() >= 2
+                && !argv[1].contains("%b")
+                && argv[1..]
+                    .iter()
+                    .all(|arg| !arg.chars().any(char::is_control)) =>
+        {
+            Ok(())
+        }
+        "which"
+            if argv.len() >= 2
+                && argv[1..].iter().all(|arg| {
+                    arg == "-a"
+                        || arg.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+')
+                        })
+                }) =>
+        {
+            Ok(())
+        }
+        "find" => Err("find expressions require confirmation, including -exec and -ok"),
+        "awk" => Err("awk programs require confirmation because they can launch subprocesses"),
+        "sed" => Err("sed programs require confirmation because GNU sed can execute commands"),
+        "cat" | "head" | "tail" | "grep" | "rg" | "file" | "ps" | "df" | "du" | "wc" => {
+            Err("shell-based file or process inspection requires confirmation; use a scoped tool for automatic access")
+        }
+        "git" | "cargo" | "npm" | "pnpm" | "code_exec" => {
+            Err("commands that can execute repository code require confirmation")
+        }
+        "cd" | "pushd" | "popd" => Err("persistent shell state changes require confirmation"),
+        _ => Err("this command has no automatic workspace argument policy"),
+    }
+}
+
+fn render_restricted_command(argv: &[String]) -> String {
+    let quoted = argv
+        .iter()
+        .map(|argument| format!("'{}'", argument.replace('\'', "'\"'\"'")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("command -p {quoted}")
 }
 
 fn provider_mesh_permission(cfg: &PermissionsConfig, args: &Value) -> PermissionResult {
@@ -914,7 +1039,7 @@ mod tests {
         let cfg = PermissionsConfig::default();
         assert!(matches!(
             cfg.can_execute_shell("git status"),
-            PermissionResult::Allowed
+            PermissionResult::Confirm(_)
         ));
         assert!(matches!(
             cfg.can_execute_shell("git-malicious status"),
@@ -940,6 +1065,40 @@ mod tests {
             cfg.can_execute_shell("git fetch origin"),
             PermissionResult::Confirm(_)
         ));
+    }
+
+    #[test]
+    fn shell_expansion_and_interpreter_escape_paths_require_confirmation() {
+        let cfg = PermissionsConfig::default();
+        for command in [
+            "echo $DEEPSEEK_API_KEY",
+            "echo \"$DEEPSEEK_API_KEY\"",
+            "echo ${DEEPSEEK_API_KEY}",
+            "find . -exec sh -c 'id' ;",
+            "find . -execdir id ;",
+            "awk 'BEGIN { system(\"id\") }'",
+            "sed -e 'e id' Cargo.toml",
+            "rg --pre sh pattern",
+        ] {
+            assert!(
+                matches!(cfg.can_execute_shell(command), PermissionResult::Confirm(_)),
+                "expected confirmation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_workspace_commands_are_parsed_and_rendered_as_argv() {
+        let cfg = PermissionsConfig::default();
+        assert!(matches!(
+            cfg.can_execute_shell("echo 'literal $HOME; value'"),
+            PermissionResult::Allowed
+        ));
+        let argv = parse_simple_shell_command("echo 'literal $HOME; value'").unwrap();
+        assert_eq!(
+            render_restricted_command(&argv),
+            "command -p 'echo' 'literal $HOME; value'"
+        );
     }
 
     #[test]

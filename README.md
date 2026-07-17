@@ -57,6 +57,8 @@ cargo build --release --locked
 
 - Tool calls pass through a shared permission engine.
 - Dangerous actions require confirmation unless pre-approved.
+- Automatic workspace shell calls are parsed as argv and run without shell
+  expansion, aliases, functions, or the caller's `PATH`.
 - Shell sessions preserve state and capture real exit codes.
 - Code execution runs through `bubblewrap` by default.
 - HTTP gateway requires `UINTELL_API_KEY` for `/ready` and `/chat`.

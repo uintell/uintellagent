@@ -101,6 +101,8 @@ struct GatewayState<M: CompletionModel> {
     rate_limits: Mutex<HashMap<String, (Instant, u32)>>,
     /// In-memory conversation history keyed by validated session ID.
     histories: Mutex<HashMap<String, SessionHistory>>,
+    /// Fixed lock stripes preserve ordering within a session without a growing map.
+    session_gates: [Mutex<()>; MAX_SESSIONS],
 }
 
 struct SessionHistory {
@@ -142,18 +144,20 @@ async fn auth_middleware<M: CompletionModel>(
 
     // Rate limiting
     let key_id = blake3::hash(key.as_bytes()).to_hex().to_string();
-    let mut limits = state.rate_limits.lock().await;
-    let entry = limits.entry(key_id).or_insert((Instant::now(), 0));
-    if entry.0.elapsed() > Duration::from_secs(60) {
-        *entry = (Instant::now(), 0);
-    }
-    entry.1 += 1;
-    if entry.1 > MAX_REQUESTS_PER_MINUTE {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "RATE_LIMITED",
-            &format!("Max {MAX_REQUESTS_PER_MINUTE} requests per minute. Retry after 60s."),
-        );
+    {
+        let mut limits = state.rate_limits.lock().await;
+        let entry = limits.entry(key_id).or_insert((Instant::now(), 0));
+        if entry.0.elapsed() > Duration::from_secs(60) {
+            *entry = (Instant::now(), 0);
+        }
+        entry.1 += 1;
+        if entry.1 > MAX_REQUESTS_PER_MINUTE {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RATE_LIMITED",
+                &format!("Max {MAX_REQUESTS_PER_MINUTE} requests per minute. Retry after 60s."),
+            );
+        }
     }
 
     next.run(request).await
@@ -276,66 +280,78 @@ async fn chat<M: CompletionModel + 'static>(
             .into_response();
     }
 
-    let history = match req.session_id.as_deref() {
-        Some(session_id) => {
-            let mut histories = state.histories.lock().await;
-            histories
-                .get_mut(session_id)
-                .map_or_else(Vec::new, |history| {
-                    history.last_used = Instant::now();
-                    history.messages.clone()
-                })
-        }
-        None => Vec::new(),
-    };
-
     match tokio::time::timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), async {
-        let agent = state.agent.lock().await;
-        agent
-            .prompt(&req.message)
-            .history(history)
-            .max_turns(12)
-            .await
+        let _session_guard = match req.session_id.as_deref() {
+            Some(session_id) => Some(
+                state.session_gates[session_gate_index(session_id)]
+                    .lock()
+                    .await,
+            ),
+            None => None,
+        };
+        let history = match req.session_id.as_deref() {
+            Some(session_id) => {
+                let mut histories = state.histories.lock().await;
+                histories
+                    .get_mut(session_id)
+                    .map_or_else(Vec::new, |history| {
+                        history.last_used = Instant::now();
+                        history.messages.clone()
+                    })
+            }
+            None => Vec::new(),
+        };
+        let prompt_result = {
+            let agent = state.agent.lock().await;
+            agent
+                .prompt(&req.message)
+                .history(history)
+                .max_turns(12)
+                .await
+        };
+        let response = match prompt_result {
+            Ok(response) => response,
+            Err(error) => return Err(error),
+        };
+        if let Some(session_id) = req.session_id.as_ref() {
+            let mut histories = state.histories.lock().await;
+            if !histories.contains_key(session_id) && histories.len() >= MAX_SESSIONS {
+                if let Some(oldest) = histories
+                    .iter()
+                    .min_by_key(|(_, history)| history.last_used)
+                    .map(|(id, _)| id.clone())
+                {
+                    histories.remove(&oldest);
+                }
+            }
+            let history = histories
+                .entry(session_id.clone())
+                .or_insert_with(|| SessionHistory {
+                    messages: Vec::new(),
+                    last_used: Instant::now(),
+                });
+            history.last_used = Instant::now();
+            history.messages.push(Message::user(req.message.clone()));
+            history.messages.push(Message::assistant(response.clone()));
+            if history.messages.len() > MAX_SESSION_MESSAGES {
+                history
+                    .messages
+                    .drain(..history.messages.len() - MAX_SESSION_MESSAGES);
+            }
+        }
+        Ok(response)
     })
     .await
     {
-        Ok(Ok(response)) => {
-            if let Some(session_id) = req.session_id {
-                let mut histories = state.histories.lock().await;
-                if !histories.contains_key(&session_id) && histories.len() >= MAX_SESSIONS {
-                    if let Some(oldest) = histories
-                        .iter()
-                        .min_by_key(|(_, history)| history.last_used)
-                        .map(|(id, _)| id.clone())
-                    {
-                        histories.remove(&oldest);
-                    }
-                }
-                let history = histories
-                    .entry(session_id)
-                    .or_insert_with(|| SessionHistory {
-                        messages: Vec::new(),
-                        last_used: Instant::now(),
-                    });
-                history.last_used = Instant::now();
-                history.messages.push(Message::user(req.message));
-                history.messages.push(Message::assistant(response.clone()));
-                if history.messages.len() > MAX_SESSION_MESSAGES {
-                    history
-                        .messages
-                        .drain(..history.messages.len() - MAX_SESSION_MESSAGES);
-                }
-            }
-            Json(ChatResponse {
-                id: request_id,
-                status: "ok".into(),
-                response: Some(response),
-                provider: state.provider.clone(),
-                usage: None,
-                error: None,
-            })
-            .into_response()
-        }
+        Ok(Ok(response)) => Json(ChatResponse {
+            id: request_id,
+            status: "ok".into(),
+            response: Some(response),
+            provider: state.provider.clone(),
+            usage: None,
+            error: None,
+        })
+        .into_response(),
         Ok(Err(e)) => (
             StatusCode::BAD_GATEWAY,
             Json(ChatResponse {
@@ -410,6 +426,13 @@ fn valid_request_id(request_id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
 }
 
+fn session_gate_index(session_id: &str) -> usize {
+    let hash = blake3::hash(session_id.as_bytes());
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(prefix) as usize % MAX_SESSIONS
+}
+
 fn uuid_v4() -> String {
     use std::fmt::Write;
     let mut r: [u8; 16] = rand::random();
@@ -442,6 +465,7 @@ where
         start_time: Instant::now(),
         rate_limits: Mutex::new(HashMap::new()),
         histories: Mutex::new(HashMap::new()),
+        session_gates: std::array::from_fn(|_| Mutex::new(())),
     });
 
     let app = Router::new()
@@ -518,5 +542,13 @@ mod tests {
         assert!(valid_request_id("deploy-42:attempt_1"));
         assert!(!valid_request_id("bad\nheader"));
         assert!(!valid_request_id(&"x".repeat(MAX_REQUEST_ID_CHARS + 1)));
+    }
+
+    #[test]
+    fn session_gate_selection_is_stable_and_bounded() {
+        let first = session_gate_index("session-a");
+        assert_eq!(first, session_gate_index("session-a"));
+        assert!(first < MAX_SESSIONS);
+        assert!(session_gate_index("session-b") < MAX_SESSIONS);
     }
 }

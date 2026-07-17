@@ -16,14 +16,14 @@ Versioning from `1.0.0` onward.
 ### Security
 
 - Replaced machine-specific permission defaults with current-workspace policy.
-- Added symlink-aware path checks, command-boundary enforcement, shell-control
+- Added symlink-aware path checks, argv-level shell authorization, command-specific
   confirmation, exact domain matching, and fail-closed configuration loading.
 - Removed provider-key fallback from gateway authentication and added bounded,
   constant-time API-key comparison.
 - Bounded gateway request bodies, request IDs, sessions, history, queue time, and
   returned proper HTTP failure statuses.
-- Moved terminal output files into private random directories and made output
-  truncation safe for Unicode and arbitrary bytes.
+- Moved terminal output files into private random directories, independently
+  drained bounded stdout/stderr, and made truncation safe for arbitrary bytes.
 - Re-authorized browser redirect targets and bounded HTTP, file, code, and
   terminal capture sizes.
 - Made provider-mesh calls fail closed through the shared permission engine.
@@ -43,7 +43,7 @@ Versioning from `1.0.0` onward.
 - Replaced the metadata-only future-Wasm placeholder with functional,
   explicitly selected Markdown instruction skills.
 - Added traversal-safe names and entrypoints, private atomic creation, bounded
-  instruction loading, and `--skill <name>` composition.
+  metadata and instruction loading, and `--skill <name>` composition.
 
 ## 0.3.0-alpha.1 - 2026-07-17
 

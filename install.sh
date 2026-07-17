@@ -49,22 +49,26 @@ install_dir="${UINTELL_INSTALL_DIR:-${HOME:?HOME must be set}/.local/bin}"
 destination="$install_dir/uintell-agent"
 backup="$install_dir/uintell-agent.previous"
 
-install -d -m 0755 "$install_dir"
+install -d -m 0755 "$install_dir" || fail "could not create install directory: $install_dir"
 
 if [[ "$action" == "--rollback" ]]; then
     [[ -x "$backup" ]] || fail "no previous UIntell Agent binary is available at $backup"
     "$backup" --version >/dev/null || fail "the previous binary failed its version check"
-    swap="$(mktemp "$install_dir/.uintell-agent.rollback.XXXXXX")"
-    rm -f -- "$swap"
+    swap="$(mktemp "$install_dir/.uintell-agent.rollback.XXXXXX")" || fail "could not create rollback staging file"
+    rm -f -- "$swap" || fail "could not prepare rollback staging path"
     if [[ -e "$destination" ]]; then
-        mv -- "$destination" "$swap"
+        mv -- "$destination" "$swap" || fail "could not stage the installed binary for rollback"
     fi
     if ! mv -- "$backup" "$destination"; then
-        [[ -e "$swap" ]] && mv -- "$swap" "$destination"
+        if [[ -e "$swap" ]] && ! mv -- "$swap" "$destination"; then
+            fail "could not restore either binary; the original remains at $swap"
+        fi
         fail "could not restore the previous binary"
     fi
     if [[ -e "$swap" ]]; then
-        mv -- "$swap" "$backup"
+        if ! mv -- "$swap" "$backup"; then
+            warn "rollback succeeded, but the replaced binary remains at $swap"
+        fi
     fi
     printf 'Rolled back %s\n' "$destination"
     "$destination" --version
@@ -75,22 +79,22 @@ fi
 [[ -x "$source_binary" ]] || fail "packaged uintell-agent is not executable"
 "$source_binary" --version >/dev/null || fail "packaged uintell-agent failed its version check"
 
-staged="$(mktemp "$install_dir/.uintell-agent.install.XXXXXX")"
+staged="$(mktemp "$install_dir/.uintell-agent.install.XXXXXX")" || fail "could not create installation staging file"
 backup_staged=""
 cleanup() {
     rm -f -- "${staged:-}" "${backup_staged:-}"
 }
 trap cleanup EXIT
-install -m 0755 "$source_binary" "$staged"
+install -m 0755 "$source_binary" "$staged" || fail "could not copy the packaged binary into staging"
 "$staged" --version >/dev/null || fail "staged uintell-agent failed its version check"
 
 if [[ -e "$destination" ]]; then
-    backup_staged="$(mktemp "$install_dir/.uintell-agent.previous.XXXXXX")"
-    cp -p -- "$destination" "$backup_staged"
-    mv -- "$backup_staged" "$backup"
+    backup_staged="$(mktemp "$install_dir/.uintell-agent.previous.XXXXXX")" || fail "could not create backup staging file"
+    cp -p -- "$destination" "$backup_staged" || fail "could not back up the installed binary"
+    mv -- "$backup_staged" "$backup" || fail "could not publish the previous binary backup"
     backup_staged=""
 fi
-mv -- "$staged" "$destination"
+mv -- "$staged" "$destination" || fail "could not publish the staged binary"
 staged=""
 
 printf 'Installed %s\n' "$destination"

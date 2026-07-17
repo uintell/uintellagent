@@ -70,20 +70,24 @@ impl Tool for Terminal {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let permission_args = json!({ "command": &args.command }).to_string();
-        if let Err(reason) = crate::permissions::enforce_tool_call(Self::NAME, &permission_args) {
-            let output = TerminalOutput {
-                success: false,
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: String::new(),
-                elapsed_ms: 0,
-                cwd: String::new(),
-                truncated: false,
-                timeout: false,
-                error: Some(reason),
+        let command =
+            match crate::permissions::authorize_terminal_command(&args.command, &permission_args) {
+                Ok(command) => command,
+                Err(reason) => {
+                    let output = TerminalOutput {
+                        success: false,
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        elapsed_ms: 0,
+                        cwd: String::new(),
+                        truncated: false,
+                        timeout: false,
+                        error: Some(reason),
+                    };
+                    return Ok(serde_json::to_string_pretty(&output).unwrap_or_default());
+                }
             };
-            return Ok(serde_json::to_string_pretty(&output).unwrap_or_default());
-        }
 
         let timeout_secs = args.timeout_secs.clamp(1, 300);
 
@@ -95,7 +99,7 @@ impl Tool for Terminal {
         }
 
         // Execute
-        match crate::session::exec(&args.command, timeout_secs).await {
+        match crate::session::exec(&command, timeout_secs).await {
             Ok(result) => {
                 let stdout_truncated = result.stdout.contains("(truncated at 50000 bytes;");
                 let stderr_truncated = result.stderr.contains("(truncated at 10000 bytes;");
