@@ -8,7 +8,7 @@ UIntell Agent 1.0 supports glibc-based Linux on x86-64. Download and verify the
 stable release archive:
 
 ```bash
-version=1.0.0
+version=1.0.1
 asset="uintell-agent-${version}-x86_64-unknown-linux-gnu"
 base_url="https://github.com/uintell/uintellagent/releases/download/v${version}"
 
@@ -29,6 +29,25 @@ available on the [Releases page](https://github.com/uintell/uintellagent/release
 When upgrading, the installer preserves the previous binary as
 `uintell-agent.previous`. Run the extracted package's `./install.sh --rollback`
 with the same `UINTELL_INSTALL_DIR` to swap back.
+
+The installer also adds native Fish completions and an `ua` function under
+`~/.config/fish` (or `$XDG_CONFIG_HOME/fish`). `ua` opens the TUI with no
+arguments and treats free-form arguments as a one-shot prompt:
+
+```fish
+ua
+ua explain this Rust borrow error
+ua doctor
+```
+
+For the current Fish process without installing files, run:
+
+```fish
+uintell-agent completions fish | source
+uintell-agent fish-init | source
+```
+
+Set `UINTELL_INSTALL_FISH=0` when a package manager owns shell configuration.
 
 GitHub Actions signs the build provenance for both release artifacts. With the
 GitHub CLI installed, verify that the downloaded archive came from this
@@ -104,6 +123,8 @@ cargo run -- --ollama --tui
 The unified TUI workspaces are:
 
 - `Alt+1`: streaming Chat. `Esc` or `Ctrl+G` cancels an active model/tool run.
+  `Up`/`Down` recall project prompt history; `Tab` or `Right` accepts the
+  visible command/history completion.
 - `Alt+2`: graph Memory, Explorer, SurrealQL Query, and Analytics.
 - `Alt+3`: the complete tool catalog. Use `:run <tool> <json>` and `:run!` for
   calls that require explicit confirmation.
@@ -114,6 +135,26 @@ The unified TUI workspaces are:
 
 The active workspace, editor file/cursor, selected task run, and graph view are
 restored from `~/.uintell/workspace.json` on the next launch.
+
+## Prompt History
+
+UIntell Agent keeps Fish-style prompt recall in
+`~/.uintell/prompt-history.json`. History is local, mode `0600`, limited to 500
+entries, and scoped to the current workspace so one project does not suggest
+another project's prompts. Inputs that resemble passwords, API tokens, private
+keys, seed phrases, or Nostr `nsec` values are not persisted. This filtering is
+defense in depth; do not paste secrets into prompts.
+
+```bash
+uintell-agent history
+uintell-agent history list --limit 50
+uintell-agent history clear
+```
+
+This input history is separate from semantic graph memory. SurrealDB continues
+to hold explicit facts, decisions, relations, datasets, and code-memory links.
+Set `UINTELL_PROMPT_HISTORY` only when a managed installation needs a different
+history file path.
 
 ## Instruction Skills
 

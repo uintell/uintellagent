@@ -19,7 +19,64 @@ Usage: ./install.sh [--install | --rollback | --help]
   --help       Show this help
 
 Set UINTELL_INSTALL_DIR to override the default ~/.local/bin destination.
+Set UINTELL_INSTALL_FISH=0 to skip Fish completion and function installation.
 EOF
+}
+
+install_fish_support() {
+    local binary="$1"
+    [[ "${UINTELL_INSTALL_FISH:-1}" != "0" ]] || return 0
+
+    local config_home="${XDG_CONFIG_HOME:-${HOME:?HOME must be set}/.config}"
+    local completion_dir="$config_home/fish/completions"
+    local function_dir="$config_home/fish/functions"
+    local completion_path="$completion_dir/uintell-agent.fish"
+    local function_path="$function_dir/ua.fish"
+    local completion_staged function_staged
+    local completion_installed=0
+    local function_installed=0
+
+    if ! install -d -m 0755 "$completion_dir" "$function_dir"; then
+        warn "could not create Fish integration directories"
+        return 0
+    fi
+    if ! completion_staged="$(mktemp "$completion_dir/.uintell-agent.XXXXXX")"; then
+        warn "could not stage Fish completions"
+        return 0
+    fi
+    if "$binary" completions fish >"$completion_staged"; then
+        if chmod 0644 "$completion_staged" && mv -- "$completion_staged" "$completion_path"; then
+            completion_installed=1
+        else
+            rm -f -- "$completion_staged"
+            warn "could not publish Fish completions"
+        fi
+    else
+        rm -f -- "$completion_staged"
+        warn "installed binary could not generate Fish completions"
+    fi
+
+    if ! function_staged="$(mktemp "$function_dir/.ua.XXXXXX")"; then
+        warn "could not stage the Fish ua function"
+        return 0
+    fi
+    if "$binary" fish-init >"$function_staged"; then
+        if chmod 0644 "$function_staged" && mv -- "$function_staged" "$function_path"; then
+            function_installed=1
+        else
+            rm -f -- "$function_staged"
+            warn "could not publish the Fish ua function"
+        fi
+    else
+        rm -f -- "$function_staged"
+        warn "installed binary could not generate the Fish ua function"
+    fi
+
+    if [[ "$completion_installed" -eq 1 && "$function_installed" -eq 1 ]]; then
+        printf 'Installed Fish completions and the `ua` function under %s/fish\n' "$config_home"
+    elif [[ "$completion_installed" -eq 1 || "$function_installed" -eq 1 ]]; then
+        warn "Fish integration was only partially installed under $config_home/fish"
+    fi
 }
 
 action="${1:---install}"
@@ -72,6 +129,7 @@ if [[ "$action" == "--rollback" ]]; then
     fi
     printf 'Rolled back %s\n' "$destination"
     "$destination" --version
+    install_fish_support "$destination"
     exit 0
 fi
 
@@ -99,6 +157,7 @@ staged=""
 
 printf 'Installed %s\n' "$destination"
 "$destination" --version
+install_fish_support "$destination"
 
 case ":${PATH:-}:" in
     *":$install_dir:"*) ;;

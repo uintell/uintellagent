@@ -13,7 +13,8 @@ Within the `1.x` series:
   removed or redefined in a minor or patch release.
 - Permission configuration version 1, task-run checkpoints version 1, workspace
   state version 1, graph snapshots version 1, graph schema version 1, and local
-  instruction-skill manifests version 1 remain readable.
+  instruction-skill manifests version 1 remain readable. Private prompt history
+  version 1 remains readable.
 - Graph schema changes are additive and initialized automatically. UIntell Agent
   refuses to open a graph created by a newer, unsupported schema instead of
   silently downgrading it.

@@ -23,6 +23,8 @@ Advisories page. Do not open a public issue for an undisclosed vulnerability.
   expansion, redirection, interpreters, repository code, and filesystem
   inspection require confirmation.
 - Release archives are checksummed and receive signed GitHub build provenance.
+- Prompt history is private, bounded, project-scoped, and skips common secret
+  forms. It is never added to model context automatically.
 
 ## Do Not Expose Publicly Without
 
@@ -45,7 +47,7 @@ Verify `SHA256SUMS` before installation. GitHub CLI users can also verify signed
 build provenance:
 
 ```bash
-gh attestation verify uintell-agent-1.0.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify uintell-agent-1.0.1-x86_64-unknown-linux-gnu.tar.gz \
   --repo uintell/uintellagent
 ```
 
@@ -56,3 +58,5 @@ gh attestation verify uintell-agent-1.0.0-x86_64-unknown-linux-gnu.tar.gz \
 - Keep code execution sandboxed.
 - Use SurrealDB credentials with the minimum required permissions.
 - Review audit logs for shell, file, network, code, and graph-memory tools.
+- Clear local prompt recall with `uintell-agent history clear` when retiring a
+  workspace or transferring a machine.

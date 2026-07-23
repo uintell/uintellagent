@@ -3,6 +3,17 @@
 All notable changes are documented here. This project follows Semantic
 Versioning from `1.0.0` onward.
 
+## 1.0.1 - 2026-07-23
+
+### Shell And Input
+
+- Added generated Fish completions and the `ua` Fish function, with automatic
+  per-user installation and a package-manager opt-out.
+- Added private, project-scoped prompt history with TUI recall, visible
+  autosuggestions, slash-command completion, CLI inspection, and clearing.
+- Added conservative secret detection so likely credentials, private keys,
+  recovery phrases, and Nostr secret keys are not written to prompt history.
+
 ## 1.0.0 - 2026-07-17
 
 ### Stable Contracts

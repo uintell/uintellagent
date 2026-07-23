@@ -18,6 +18,7 @@ use crate::confirm::{self, ConfirmState};
 use crate::db_tui::{GraphConsole, GraphConsoleAction, GraphConsoleState};
 use crate::editor::{self, Editor};
 use crate::lsp;
+use crate::prompt_history::{PromptHistory, RecordOutcome};
 use crate::provider_health::ProviderHealth;
 use crate::task_run::{
     TaskNotification, TaskRun, TaskRunStatus, TaskRunSummary, TaskStore, TaskView,
@@ -219,6 +220,21 @@ fn chat_input(lines: Vec<String>) -> tui_textarea::TextArea<'static> {
     input
 }
 
+const CHAT_COMPLETIONS: &[&str] = &[
+    "/clear",
+    "/exit",
+    "/health",
+    "/help",
+    "/history",
+    "/history clear",
+    "/load ",
+    "/quit",
+    "/runs",
+    "/save ",
+    "/sessions",
+    "/task ",
+];
+
 // ═══════════════════════════════════════════════════════════════
 // APP STATE
 // ═══════════════════════════════════════════════════════════════
@@ -238,6 +254,7 @@ struct App<M: CompletionModel + 'static> {
     provider_label: String,
     provider_health: ProviderHealth,
     chat_history: Vec<RigMessage>,
+    prompt_history: PromptHistory,
     // Memory
     memory_console: GraphConsole,
     // Tools
@@ -283,15 +300,26 @@ impl<M: CompletionModel + 'static> App<M> {
     fn new(agent: Agent<M>, provider_label: &str, provider_health: ProviderHealth) -> Self {
         let ta = chat_input(Vec::new());
         let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut messages = VecDeque::from([Message {
+            kind: MsgKind::System,
+            text: format!(
+                "UIntell · {provider_label}\n{}\nAlt+Enter send | /help commands | Alt+1/2/3/4/5 workspaces\n",
+                provider_health.detail()
+            ),
+        }]);
+        let prompt_history = match PromptHistory::load_current() {
+            Ok(history) => history,
+            Err(error) => {
+                messages.push_back(Message {
+                    kind: MsgKind::Error,
+                    text: format!("Prompt history was not loaded: {error}"),
+                });
+                PromptHistory::empty_current()
+            }
+        };
         Self {
             tab: Tab::Chat,
-            messages: VecDeque::from([Message {
-                kind: MsgKind::System,
-                text: format!(
-                    "UIntell · {provider_label}\n{}\nAlt+Enter send | /help commands | Alt+1/2/3/4/5 workspaces\n",
-                    provider_health.detail()
-                ),
-            }]),
+            messages,
             input: ta,
             thinking: false,
             streaming_text: String::new(),
@@ -302,6 +330,7 @@ impl<M: CompletionModel + 'static> App<M> {
             provider_label: provider_label.into(),
             provider_health,
             chat_history: Vec::new(),
+            prompt_history,
             memory_console: GraphConsole::embedded(),
             tool_selected: 0,
             tool_output: String::new(),
@@ -345,6 +374,70 @@ impl<M: CompletionModel + 'static> App<M> {
             self.messages.pop_front();
         }
     }
+}
+
+fn chat_text(input: &tui_textarea::TextArea<'_>) -> String {
+    input.lines().join("\n")
+}
+
+fn replace_chat_input<M: CompletionModel>(app: &mut App<M>, text: &str) {
+    app.input = chat_input(text.split('\n').map(str::to_string).collect());
+    app.input.move_cursor(CursorMove::Bottom);
+    app.input.move_cursor(CursorMove::End);
+}
+
+fn slash_suggestion(input: &str) -> Option<&'static str> {
+    if !input.starts_with('/') || input.contains('\n') {
+        return None;
+    }
+    CHAT_COMPLETIONS
+        .iter()
+        .copied()
+        .find(|candidate| candidate.len() > input.len() && candidate.starts_with(input))
+}
+
+fn chat_suggestion<M: CompletionModel>(app: &App<M>) -> Option<String> {
+    let input = chat_text(&app.input);
+    slash_suggestion(&input)
+        .map(str::to_string)
+        .or_else(|| app.prompt_history.suggestion(&input).map(str::to_string))
+}
+
+fn chat_cursor_at_end(input: &tui_textarea::TextArea<'_>) -> bool {
+    let cursor = input.cursor();
+    let row = cursor.0;
+    let column = cursor.1;
+    row + 1 == input.lines().len()
+        && input
+            .lines()
+            .get(row)
+            .is_some_and(|line| column == line.chars().count())
+}
+
+fn accept_chat_suggestion<M: CompletionModel>(app: &mut App<M>) -> bool {
+    let Some(suggestion) = chat_suggestion(app) else {
+        return false;
+    };
+    replace_chat_input(app, &suggestion);
+    app.prompt_history.reset_navigation();
+    true
+}
+
+fn recall_previous_prompt<M: CompletionModel>(app: &mut App<M>) -> bool {
+    let current = chat_text(&app.input);
+    let Some(prompt) = app.prompt_history.previous(&current) else {
+        return false;
+    };
+    replace_chat_input(app, &prompt);
+    true
+}
+
+fn recall_next_prompt<M: CompletionModel>(app: &mut App<M>) -> bool {
+    let Some(prompt) = app.prompt_history.next() else {
+        return false;
+    };
+    replace_chat_input(app, &prompt);
+    true
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -846,7 +939,10 @@ fn render_tabs(frame: &mut ratatui::Frame, area: Rect, app: &App<impl Completion
         })
         .collect();
     let hint = match app.tab {
-        Tab::Chat => Span::styled(" Alt+Enter send | /help", Style::default().fg(DARK_GRAY)),
+        Tab::Chat => Span::styled(
+            " Alt+Enter send | Tab complete | Up/Down history | /help",
+            Style::default().fg(DARK_GRAY),
+        ),
         Tab::Memory => Span::styled(
             " 1-4 graph views | Alt+1-5 agent tabs | drag/lasso | :help",
             Style::default().fg(DARK_GRAY),
@@ -888,8 +984,12 @@ fn render_tabs(frame: &mut ratatui::Frame, area: Rect, app: &App<impl Completion
 fn render_chat<M: CompletionModel>(frame: &mut ratatui::Frame, area: Rect, app: &App<M>) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(4)])
+        .constraints([Constraint::Min(3), Constraint::Length(5)])
         .split(area);
+    let composer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Length(1)])
+        .split(layout[1]);
     let msg_area = layout[0];
     let vh = msg_area.height as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -984,17 +1084,35 @@ fn render_chat<M: CompletionModel>(frame: &mut ratatui::Frame, area: Rect, app: 
             &mut sb,
         );
     }
-    frame.render_widget(&app.input, layout[1]);
-    if app.input.lines().join("\n").is_empty() {
+    frame.render_widget(&app.input, composer[0]);
+    let current_input = chat_text(&app.input);
+    if current_input.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " Alt+Enter to send  |  /help for commands",
+                " Write a prompt or /command",
                 Style::default().fg(DARK_GRAY),
             )))
             .bg(BG),
-            layout[1],
+            composer[0],
         );
     }
+    let input_hint = if let Some(suggestion) = chat_suggestion(app) {
+        let tail = suggestion
+            .strip_prefix(&current_input)
+            .unwrap_or(&suggestion)
+            .replace('\n', " ");
+        Line::from(vec![
+            Span::styled(" complete ", Style::default().fg(BG).bg(DIM_GREEN)),
+            Span::styled(preview_text(&tail, 72), Style::default().fg(GRAY)),
+            Span::styled("  Tab/Right accept", Style::default().fg(DARK_GRAY)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            " Alt+Enter send  ·  Up/Down recall  ·  PageUp/PageDown scroll",
+            Style::default().fg(DARK_GRAY),
+        ))
+    };
+    frame.render_widget(Paragraph::new(input_hint).bg(BG), composer[1]);
 }
 
 // ── Tools Tab ───────────────────────────────────────────────────
@@ -1776,7 +1894,7 @@ fn handle_chat_cmd<M: CompletionModel>(app: &mut App<M>, cmd: &str) -> bool {
             app.scroll = 0;
         }
         "/help" => {
-            app.add_msg(MsgKind::System, "Commands: /task /runs /health /exit /clear /save /load /sessions\nKeys: Alt+1=Chat Alt+2=Memory Alt+3=Tools Alt+4=Editor Alt+5=Runs Alt+Enter=send".into());
+            app.add_msg(MsgKind::System, "Commands: /task /runs /health /history /exit /clear /save /load /sessions\nKeys: Alt+1=Chat Alt+2=Memory Alt+3=Tools Alt+4=Editor Alt+5=Runs Alt+Enter=send Up/Down=history Tab/Right=complete".into());
         }
         "/task" => {
             let objective = parts.get(1).copied().unwrap_or("").trim();
@@ -1802,6 +1920,35 @@ fn handle_chat_cmd<M: CompletionModel>(app: &mut App<M>, cmd: &str) -> bool {
             },
             app.provider_health.detail().to_string(),
         ),
+        "/history" => {
+            if parts.get(1).is_some_and(|action| action.trim() == "clear") {
+                match app.prompt_history.clear_current() {
+                    Ok(removed) => app.add_msg(
+                        MsgKind::System,
+                        format!("Cleared {removed} prompt history entries"),
+                    ),
+                    Err(error) => {
+                        app.add_msg(MsgKind::Error, format!("History clear failed: {error}"))
+                    }
+                }
+            } else {
+                let entries = app.prompt_history.recent(20);
+                let output = if entries.is_empty() {
+                    "No prompt history for this workspace".to_string()
+                } else {
+                    entries
+                        .into_iter()
+                        .rev()
+                        .enumerate()
+                        .map(|(index, entry)| {
+                            format!("{}. {}", index + 1, entry.replace('\n', " "))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                app.add_msg(MsgKind::System, output);
+            }
+        }
         "/save" => {
             let n = parts.get(1).copied().unwrap_or("default");
             match save_session(n, &app.messages.iter().cloned().collect::<Vec<_>>()) {
@@ -2534,9 +2681,8 @@ fn stage_editor_context<M: CompletionModel>(app: &mut App<M>, durable: bool) {
     } else {
         format!("{existing}\n\n{context_block}")
     };
-    app.input = chat_input(text.split('\n').map(str::to_string).collect());
-    app.input.move_cursor(CursorMove::Bottom);
-    app.input.move_cursor(CursorMove::End);
+    replace_chat_input(app, &text);
+    app.prompt_history.reset_navigation();
     app.tab = Tab::Chat;
     app.status_line = if durable {
         " durable run objective staged · Alt+Enter to start".into()
@@ -3996,6 +4142,7 @@ enum ChatSubmission {
 fn submit_chat<M: CompletionModel>(app: &mut App<M>) -> Option<ChatSubmission> {
     let text = app.input.lines().join("\n");
     app.input = chat_input(Vec::new());
+    app.prompt_history.reset_navigation();
     if text.is_empty() {
         return None;
     }
@@ -4014,6 +4161,18 @@ fn submit_chat<M: CompletionModel>(app: &mut App<M>) -> Option<ChatSubmission> {
             return Some(ChatSubmission::Exit);
         }
         return None;
+    }
+    match app.prompt_history.record(&text) {
+        Ok(RecordOutcome::SkippedSensitive) => {
+            app.status_line = " prompt not saved to history because it may contain a secret".into();
+        }
+        Ok(RecordOutcome::SkippedTooLarge) => {
+            app.status_line = " prompt too large for local history".into();
+        }
+        Ok(RecordOutcome::Stored | RecordOutcome::SkippedEmpty) => {}
+        Err(error) => {
+            app.status_line = format!(" prompt history warning: {error}");
+        }
     }
     if !app.provider_health.is_ready() {
         let detail = app.provider_health.detail().to_string();
@@ -4532,16 +4691,33 @@ async fn run_loop<M: CompletionModel + 'static>(
                             }
                             (KeyModifiers::NONE, KeyCode::Up) => {
                                 if app.input.cursor().0 == 0 {
-                                    app.scroll += 1;
+                                    if !recall_previous_prompt(app) {
+                                        app.scroll += 1;
+                                    }
                                     continue;
                                 }
                             }
                             (KeyModifiers::NONE, KeyCode::Down) => {
                                 if app.input.cursor().0 >= app.input.lines().len().saturating_sub(1)
                                 {
-                                    app.scroll = app.scroll.saturating_sub(1);
+                                    if !recall_next_prompt(app) {
+                                        app.scroll = app.scroll.saturating_sub(1);
+                                    }
                                     continue;
                                 }
+                            }
+                            (KeyModifiers::NONE, KeyCode::Tab) => {
+                                let _ = accept_chat_suggestion(app);
+                                continue;
+                            }
+                            (KeyModifiers::NONE, KeyCode::Right | KeyCode::End)
+                                if chat_cursor_at_end(&app.input) =>
+                            {
+                                if !accept_chat_suggestion(app) {
+                                    app.prompt_history.reset_navigation();
+                                    let _ = app.input.input(key);
+                                }
+                                continue;
                             }
                             (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
                                 let n = app
@@ -4564,6 +4740,7 @@ async fn run_loop<M: CompletionModel + 'static>(
                                 continue;
                             }
                             _ => {
+                                app.prompt_history.reset_navigation();
                                 let _ = app.input.input(key);
                             }
                         }
@@ -4994,6 +5171,18 @@ mod tests {
             workspace_shortcut(Tab::Chat, true, key(KeyCode::Char('2'), KeyModifiers::ALT)),
             Some(Tab::Memory)
         );
+    }
+
+    #[test]
+    fn chat_completes_slash_commands_and_detects_the_input_end() {
+        assert_eq!(slash_suggestion("/he"), Some("/health"));
+        assert_eq!(slash_suggestion("plain text"), None);
+
+        let mut input = chat_input(vec!["cargo te".into()]);
+        input.move_cursor(CursorMove::End);
+        assert!(chat_cursor_at_end(&input));
+        input.move_cursor(CursorMove::Back);
+        assert!(!chat_cursor_at_end(&input));
     }
 
     #[test]

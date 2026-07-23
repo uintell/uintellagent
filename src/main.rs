@@ -10,9 +10,11 @@ mod knowledge_graph;
 mod lsp;
 mod mesh;
 mod permissions;
+mod prompt_history;
 mod provider_health;
 mod rig_runtime;
 mod session;
+mod shell;
 mod skills;
 mod task_run;
 mod tool_result;
@@ -86,6 +88,18 @@ enum Command {
     Capabilities,
     /// Verify the provider, graph memory, permissions, and code runtimes.
     Doctor,
+    /// Generate completion definitions for a supported shell.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Print the `ua` Fish function and wrapper completion definition.
+    FishInit,
+    /// Inspect or clear private prompt history for the current workspace.
+    History {
+        #[command(subcommand)]
+        action: Option<HistoryCommand>,
+    },
     /// Create, inspect, resume, and monitor durable autonomous coding runs.
     Task {
         #[command(subcommand)]
@@ -130,6 +144,17 @@ enum TaskCommand {
     List,
     /// Show one run's steps, events, and final result.
     Show { id: String },
+}
+
+#[derive(clap::Subcommand)]
+enum HistoryCommand {
+    /// List recent prompts for the current workspace.
+    List {
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Permanently clear prompt history for the current workspace.
+    Clear,
 }
 
 #[tokio::main]
@@ -203,6 +228,17 @@ async fn main() -> anyhow::Result<()> {
             }
             Command::Doctor => {
                 return run_doctor(cli.ollama, &cli.model).await;
+            }
+            Command::Completions { shell: target } => {
+                shell::print_completions::<Cli>(target);
+                return Ok(());
+            }
+            Command::FishInit => {
+                shell::print_fish_init();
+                return Ok(());
+            }
+            Command::History { action } => {
+                return run_history_command(action);
             }
             Command::Task { action } => {
                 return run_task_command(action, cli.ollama, &cli.model, preamble).await;
@@ -327,6 +363,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     ensure_graph_memory_ready().await;
+    if let Some(prompt) = cli.prompt.as_deref() {
+        if let Err(error) = prompt_history::record_current(prompt) {
+            eprintln!("Prompt history warning: {error}");
+        }
+    }
 
     if cli.ollama {
         let client = ollama_client()?;
@@ -425,6 +466,30 @@ async fn main() -> anyhow::Result<()> {
 
 fn create_non_interactive_hook() -> confirm::ConfirmHook {
     confirm::ConfirmHook::non_interactive()
+}
+
+fn run_history_command(action: Option<HistoryCommand>) -> anyhow::Result<()> {
+    let mut history = prompt_history::PromptHistory::load_current()?;
+    match action.unwrap_or(HistoryCommand::List { limit: 20 }) {
+        HistoryCommand::List { limit } => {
+            let entries = history.recent(limit.clamp(1, 500));
+            if entries.is_empty() {
+                println!("No prompt history for this workspace.");
+            } else {
+                for entry in entries.into_iter().rev() {
+                    println!("{}", entry.replace('\n', "\\n"));
+                }
+            }
+        }
+        HistoryCommand::Clear => {
+            let removed = history.clear_current()?;
+            println!(
+                "Cleared {removed} prompt history entr{}.",
+                if removed == 1 { "y" } else { "ies" }
+            );
+        }
+    }
+    Ok(())
 }
 
 fn command_uses_provider(command: &Command) -> bool {
@@ -882,6 +947,13 @@ fn build_deepseek_agent(
 
 async fn interactive_chat<M: CompletionModel + 'static>(agent: Agent<M>) -> anyhow::Result<()> {
     let mut history = Vec::<Message>::new();
+    let mut prompt_history = match prompt_history::PromptHistory::load_current() {
+        Ok(history) => history,
+        Err(error) => {
+            eprintln!("Prompt history warning: {error}");
+            prompt_history::PromptHistory::empty_current()
+        }
+    };
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -916,6 +988,24 @@ async fn interactive_chat<M: CompletionModel + 'static>(agent: Agent<M>) -> anyh
                     }
                 }
                 Err(e) => eprintln!("{e}"),
+            }
+            continue;
+        }
+        if input == "/history" {
+            let entries = prompt_history.recent(20);
+            if entries.is_empty() {
+                println!("No prompt history for this workspace.");
+            } else {
+                for entry in entries.into_iter().rev() {
+                    println!("{}", entry.replace('\n', "\\n"));
+                }
+            }
+            continue;
+        }
+        if input == "/history clear" {
+            match prompt_history.clear_current() {
+                Ok(removed) => println!("Cleared {removed} prompt history entries."),
+                Err(error) => eprintln!("History error: {error}"),
             }
             continue;
         }
@@ -957,6 +1047,9 @@ async fn interactive_chat<M: CompletionModel + 'static>(agent: Agent<M>) -> anyh
                 Err(e) => eprintln!("[!] {e}"),
             }
             continue;
+        }
+        if let Err(error) = prompt_history.record(input) {
+            eprintln!("Prompt history warning: {error}");
         }
         match agent
             .prompt(input)
