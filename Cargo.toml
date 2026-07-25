@@ -1,6 +1,6 @@
 [package]
 name = "uintell-agent"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "Rust-native AI agent with a TUI, tools, durable runs, and graph memory"
 license = "MIT"
