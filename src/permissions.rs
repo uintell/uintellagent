@@ -466,6 +466,7 @@ fn permission_for_tool_with_config(
         "graph_forget" => cfg.can_access_db("DELETE"),
         "graph_query" | "graph_context" => cfg.can_access_db("SELECT"),
         "provider_mesh" => provider_mesh_permission(cfg, args),
+        "godmode" => godmode_permission(cfg, args),
         _ => PermissionResult::Denied(format!("unknown tool: {tool_name}")),
     }
 }
@@ -862,6 +863,17 @@ fn provider_mesh_permission(cfg: &PermissionsConfig, args: &Value) -> Permission
     }
 
     confirmation.map_or(PermissionResult::Allowed, PermissionResult::Confirm)
+}
+
+fn godmode_permission(cfg: &PermissionsConfig, args: &Value) -> PermissionResult {
+    let provider = string_arg(args, "provider").unwrap_or("deepseek");
+    let host = match provider {
+        "deepseek" => "api.deepseek.com",
+        "ollama" => "127.0.0.1",
+        "openrouter" => "openrouter.ai",
+        _ => return PermissionResult::Denied(format!("unknown godmode provider: {provider}")),
+    };
+    cfg.can_access_network(host)
 }
 
 fn domain_matches(pattern: &str, host: &str) -> bool {

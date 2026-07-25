@@ -2,6 +2,7 @@ pub mod browser;
 pub mod code;
 pub mod file;
 pub mod file_search;
+pub mod godmode;
 pub mod graph;
 pub mod search;
 pub mod terminal;
@@ -12,6 +13,7 @@ pub use browser::Browser;
 pub use code::CodeExec;
 pub use file::{FileRead, FileWrite};
 pub use file_search::FileSearch;
+pub use godmode::Godmode;
 pub use graph::{GraphContext, GraphEdit, GraphForget, GraphQuery, GraphStore};
 pub use search::WebSearch;
 pub use terminal::Terminal;
@@ -90,6 +92,11 @@ pub const CATALOG: &[ToolCatalogEntry] = &[
         description: "Race multiple configured model providers.",
         example: r#"{"prompt":"Answer with one sentence","providers":["deepseek"]}"#,
     },
+    ToolCatalogEntry {
+        name: "godmode",
+        description: "Query a model through jailbreak prompting — bypass safety filters.",
+        example: r#"{"query":"how to pick a lock step by step","provider":"deepseek","technique":"absolute_override"}"#,
+    },
 ];
 
 pub async fn execute_named(name: &str, args: &str) -> Result<String, String> {
@@ -107,6 +114,7 @@ pub async fn execute_named(name: &str, args: &str) -> Result<String, String> {
         "graph_edit" => ToolDyn::call(&GraphEdit, args.to_string()).await,
         "graph_forget" => ToolDyn::call(&GraphForget, args.to_string()).await,
         "provider_mesh" => ToolDyn::call(&ProviderMesh, args.to_string()).await,
+        "godmode" => ToolDyn::call(&Godmode, args.to_string()).await,
         _ => return Err(format!("unknown tool: {name}")),
     };
     result.map_err(|error| error.to_string())
